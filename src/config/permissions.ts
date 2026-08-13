@@ -26,5 +26,13 @@ export const WORKFLOW_PERMISSIONS: Permission[] = [
   { name: "tag.asset", description: "Assign tags to assets" },
 ];
 
+export const FACE_LABEL_PERMISSIONS: Permission[] = [
+  { name: "person.read", description: "Read people and face clusters" },
+  { name: "person.update", description: "Name people and hide junk clusters" },
+  { name: "person.merge", description: "Merge clusters into one person" },
+  { name: "asset.read", description: "Read filenames and folders for name suggestions" },
+  { name: "asset.view", description: "Show face thumbnails and photos" },
+];
+
 export const getPermissionNames = (permissions: Permission[]): string[] =>
   permissions.map((p) => p.name);

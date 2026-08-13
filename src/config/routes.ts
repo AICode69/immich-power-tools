@@ -14,6 +14,12 @@ export const UPDATE_PERSON_PATH = (id: string) => BASE_PROXY_ENDPOINT + "/people
 export const MERGE_PERSON_PATH = (id: string) => BASE_PROXY_ENDPOINT + "/people/" + id + "/merge";
 
 
+// Power Face Label
+export const FACE_LABEL_QUEUE_PATH = BASE_API_ENDPOINT + "/people/label/queue";
+export const FACE_LABEL_APPLY_PATH = BASE_API_ENDPOINT + "/people/label/apply";
+export const FACE_LABEL_TOKEN_INDEX_PATH = BASE_API_ENDPOINT + "/people/label/token-index";
+export const FACE_LABEL_DUPLICATES_PATH = BASE_API_ENDPOINT + "/people/label/duplicates";
+
 export const EXIF_DISTRIBUTION_PATH = (column: string) => BASE_API_ENDPOINT + "/analytics/exif/" + column;
 
 // Albums
