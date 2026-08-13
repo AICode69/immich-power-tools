@@ -45,6 +45,20 @@ const FACES_PER_CLUSTER_FOR_TOKENS = 20;
 /** Albums larger than this are ignored for the social signal — too generic, too slow. */
 const MAX_ALBUM_SIZE_FOR_SOCIAL = 2000;
 
+/**
+ * Bind a list of uuids as a SINGLE query parameter.
+ *
+ * Drizzle's `sql` template expands a JS array into a parameter tuple
+ * — `($1, $2, ... $n)` — which Postgres cannot cast to `uuid[]`, so the
+ * natural-looking `= ANY(${uuidArray(ids)})` fails at runtime with
+ * "Failed query". Joining to one string and letting Postgres split it keeps
+ * this to a single bound parameter whatever the length.
+ *
+ * Callers must pass a non-empty list: `string_to_array('', ',')` yields `{""}`,
+ * which then fails the uuid cast.
+ */
+const uuidArray = (ids: string[]) => sql`string_to_array(${ids.join(",")}, ',')::uuid[]`;
+
 type QueueScope = "both" | "clusters" | "unassigned";
 
 interface FaceRow {
@@ -165,7 +179,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           FROM asset_face af
           JOIN face_search fs ON fs."faceId" = af.id
           JOIN person p ON p.id = af."personId"
-          WHERE af."personId" = ANY(${clusterIds}::uuid[])
+          WHERE af."personId" = ANY(${uuidArray(clusterIds)})
             AND af."deletedAt" IS NULL
             AND af."isVisible" IS TRUE
           ORDER BY af."personId", (af.id = p."faceAssetId") DESC, af.id
@@ -187,8 +201,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
            AND af2.id <> af1.id
            AND af2."deletedAt" IS NULL
            AND af2."isVisible" IS TRUE
-          WHERE af1."personId" = ANY(${clusterIds}::uuid[])
-            AND af2."personId" = ANY(${clusterIds}::uuid[])
+          WHERE af1."personId" = ANY(${uuidArray(clusterIds)})
+            AND af2."personId" = ANY(${uuidArray(clusterIds)})
             AND af1."personId" < af2."personId"
             AND af1."deletedAt" IS NULL
             AND af1."isVisible" IS TRUE
@@ -252,7 +266,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           AND af."isVisible" IS TRUE
           ${
             skipFaceIds.length
-              ? sql`AND NOT (af.id = ANY(${skipFaceIds}::uuid[]))`
+              ? sql`AND NOT (af.id = ANY(${uuidArray(skipFaceIds)}))`
               : sql``
           }
         -- Biggest faces first: more pixels means a better embedding and a
@@ -353,7 +367,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             ON a.id = af."assetId"
            AND a."deletedAt" IS NULL
            AND a.status = 'active'
-          WHERE af."personId" = ANY(${visibleClusterIds}::uuid[])
+          WHERE af."personId" = ANY(${uuidArray(visibleClusterIds)})
             AND af."deletedAt" IS NULL
             AND af."isVisible" IS TRUE
         ) ranked
@@ -403,7 +417,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         WITH probes AS (
           SELECT fs."faceId" AS probe_face_id, fs.embedding AS embedding
           FROM face_search fs
-          WHERE fs."faceId" = ANY(${probeFaceIds}::uuid[])
+          WHERE fs."faceId" = ANY(${uuidArray(probeFaceIds)})
         )
         SELECT probes.probe_face_id,
                nn.person_id,
@@ -455,7 +469,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           ON p2.id = af."personId"
          AND p2."ownerId" = ${ownerId}
          AND p2.name <> ''
-        WHERE af."assetId" = ANY(${allAssetIds}::uuid[])
+        WHERE af."assetId" = ANY(${uuidArray(allAssetIds)})
           AND af."deletedAt" IS NULL
           AND af."isVisible" IS TRUE
         GROUP BY af."assetId", p2.id, p2.name
@@ -475,7 +489,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         WITH albums_of_interest AS (
           SELECT DISTINCT aa."albumId" AS album_id
           FROM album_asset aa
-          WHERE aa."assetId" = ANY(${allAssetIds}::uuid[])
+          WHERE aa."assetId" = ANY(${uuidArray(allAssetIds)})
         ),
         album_sizes AS (
           SELECT aa."albumId" AS album_id, count(*)::int AS n
@@ -486,7 +500,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         source AS (
           SELECT DISTINCT aa."assetId" AS asset_id, aa."albumId" AS album_id
           FROM album_asset aa
-          WHERE aa."assetId" = ANY(${allAssetIds}::uuid[])
+          WHERE aa."assetId" = ANY(${uuidArray(allAssetIds)})
         )
         SELECT s.asset_id, p2.id AS person_id, p2.name AS name,
                count(DISTINCT af2."assetId")::int AS shared
