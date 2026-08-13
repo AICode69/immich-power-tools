@@ -59,17 +59,28 @@ export const faceLabelIndexMeta = sqliteTable(
   }
 );
 
-/** Clusters the user chose to skip, so they stop coming back in the queue. */
+/**
+ * Things the user chose to skip, so they stop coming back in the queue.
+ *
+ * `targetId` is a person id when kind = "cluster" and a face id when
+ * kind = "face" — unassigned faces have no person row to key against.
+ *
+ * The underlying column is still called `person_id`: it predates face-level
+ * skipping, and renaming it would rebuild a table that is already live on
+ * deployed instances for no functional gain.
+ */
 export const faceLabelSkips = sqliteTable(
   "face_label_skips",
   {
     id: text("id").primaryKey().$defaultFn(() => randomUUID()),
     ownerId: text("owner_id").notNull(),
-    personId: text("person_id").notNull(),
+    // "cluster" | "face"
+    kind: text("kind").notNull().default("cluster"),
+    targetId: text("person_id").notNull(),
     skippedAt: integer("skipped_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
   },
   (t) => [
-    unique().on(t.ownerId, t.personId),
-    index("face_label_skips_owner_idx").on(t.ownerId),
+    unique().on(t.ownerId, t.kind, t.targetId),
+    index("face_label_skips_owner_idx").on(t.ownerId, t.kind),
   ]
 );

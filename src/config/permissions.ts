@@ -29,7 +29,10 @@ export const WORKFLOW_PERMISSIONS: Permission[] = [
 export const FACE_LABEL_PERMISSIONS: Permission[] = [
   { name: "person.read", description: "Read people and face clusters" },
   { name: "person.update", description: "Name people and hide junk clusters" },
+  { name: "person.create", description: "Create a person for unassigned faces" },
   { name: "person.merge", description: "Merge clusters into one person" },
+  { name: "face.read", description: "Read detected faces" },
+  { name: "face.update", description: "Assign unassigned faces to a person" },
   { name: "asset.read", description: "Read filenames and folders for name suggestions" },
   { name: "asset.view", description: "Show face thumbnails and photos" },
 ];

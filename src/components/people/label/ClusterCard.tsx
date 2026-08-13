@@ -6,7 +6,7 @@ import { searchPeople } from "@/handlers/api/people.handler";
 import { cn } from "@/lib/utils";
 import { IFaceLabelGroup, IFaceLabelSuggestion } from "@/types/faceLabel";
 import { IPerson } from "@/types/person";
-import { EyeOff, Images, SkipForward, Users } from "lucide-react";
+import { EyeOff, Images, ScanFace, SkipForward, Users } from "lucide-react";
 import React, { useState } from "react";
 import FaceCrop from "./FaceCrop";
 import FullPhotoPreview from "./FullPhotoPreview";
@@ -72,7 +72,11 @@ export default function ClusterCard({
     if (!decision) return null;
     if (decision.action === "hide") return "Will be hidden";
     if (decision.action === "skip") return "Skipped";
-    if (decision.action === "merge") return `Merge into ${decision.name}`;
+    if (decision.action === "merge") {
+      return group.kind === "faces"
+        ? `Assign to ${decision.name}`
+        : `Merge into ${decision.name}`;
+    }
     return `Name "${decision.name}"`;
   };
 
@@ -94,25 +98,34 @@ export default function ClusterCard({
             <Images className="h-3.5 w-3.5" />
             {group.faceCount} {group.faceCount === 1 ? "face" : "faces"}
           </span>
-          {group.clusterIds.length > 1 && (
-            <Badge variant="secondary" className="gap-1">
-              <Users className="h-3 w-3" />
-              {group.clusterIds.length} clusters
+          {group.kind === "faces" ? (
+            <Badge variant="outline" className="gap-1" title="Immich never grouped these into a person">
+              <ScanFace className="h-3 w-3" />
+              unassigned
             </Badge>
+          ) : (
+            group.clusterIds.length > 1 && (
+              <Badge variant="secondary" className="gap-1">
+                <Users className="h-3 w-3" />
+                {group.clusterIds.length} clusters
+              </Badge>
+            )
           )}
         </div>
         <div className="flex items-center gap-1">
-          <Button
-            size="sm"
-            variant={decision?.action === "hide" ? "default" : "ghost"}
-            className="h-7 px-2"
-            title="Not a real person — hide it in Immich"
-            onClick={() =>
-              onChange(decision?.action === "hide" ? undefined : { action: "hide" })
-            }
-          >
-            <EyeOff className="h-3.5 w-3.5" />
-          </Button>
+          {group.kind === "cluster" && (
+            <Button
+              size="sm"
+              variant={decision?.action === "hide" ? "default" : "ghost"}
+              className="h-7 px-2"
+              title="Not a real person — hide it in Immich"
+              onClick={() =>
+                onChange(decision?.action === "hide" ? undefined : { action: "hide" })
+              }
+            >
+              <EyeOff className="h-3.5 w-3.5" />
+            </Button>
+          )}
           <Button
             size="sm"
             variant={decision?.action === "skip" ? "default" : "ghost"}

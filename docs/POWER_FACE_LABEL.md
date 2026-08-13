@@ -10,9 +10,23 @@ press **Apply**.
 
 ## What it works on
 
-Unnamed **person clusters** — Immich's automatic face groupings that have no name
-yet (`person.name = ''`). Individually unassigned faces and relabelling of
-already-named people are out of scope.
+Two kinds of unlabelled face, because Immich leaves them in two different states:
+
+**Unassigned faces** (`asset_face.personId IS NULL`) — the important ones. Immich's
+facial recognition only creates a person once it finds `minFaces` similar faces
+(default **3**). Everything below that threshold is never grouped, never becomes a
+person, and never appears in Immich's people view at all. On a large library this
+is usually where nearly all the remaining work is, and it is invisible in Immich's
+own UI. These have no person record, so labelling one means creating a person (or
+picking an existing one) and attaching the face to it.
+
+**Unnamed clusters** (`person.name = ''`) — groups Immich did form but nobody has
+named. These are the ones Immich's people view already shows you.
+
+The **What to review** setting in Tuning switches between them; the default covers
+both, clusters first.
+
+Relabelling already-named people is out of scope.
 
 ## How suggestions are ranked
 
@@ -66,10 +80,13 @@ Two directions, and the negative one is the more useful:
 
 ## Grouping
 
-Unnamed clusters whose representative embeddings are similar enough are grouped so
-one name covers several at once. Grouping is deliberately conservative:
+Unnamed clusters — and, separately, unassigned faces — whose embeddings are
+similar enough are grouped so one name covers several at once. Grouping is
+deliberately conservative:
 
-- clusters that share a photo are **never** grouped, whatever the embeddings say;
+- items that share a photo are **never** grouped, whatever the embeddings say (two
+  faces in one photo are two different people; for unassigned faces this needs no
+  query, the asset id is already on the row);
 - a group stops growing at 8 clusters;
 - a cluster only joins if it is similar to *every* existing member, not just one —
   plain single-linkage chaining is how "group similar clusters" quietly fuses two
@@ -77,12 +94,16 @@ one name covers several at once. Grouping is deliberately conservative:
 
 ## Applying
 
-| Action | What it does | Reversible |
+| Action | Unnamed cluster | Unassigned face |
 |---|---|---|
-| Name | Sets a new name on every cluster in the group | Yes |
-| Merge | Absorbs the cluster into an existing named person | **No** |
-| Hide | Marks the cluster hidden in Immich (junk, strangers, posters) | Yes |
-| Skip | Remembers the cluster locally so it stops appearing | Yes |
+| Name | Renames the cluster (reversible) | Creates a person, then attaches the face |
+| Merge / Assign | Absorbs the cluster into an existing person (**not reversible**) | Attaches the face to that person (reversible — reassign or unassign) |
+| Hide | Marks the cluster hidden in Immich | Not applicable; recorded as a skip instead |
+| Skip | Remembered locally so it stops appearing | Same |
+
+Assigning a face uses `PUT /api/faces/{personId}` with `{ id: faceId }`. Note the
+path parameter is the **person**, not the face, despite the route name — verified
+against Immich's `PersonService.reassignFacesById(auth, personId, dto)`.
 
 Renames and hides go out as a single `PUT /api/people` call. Merges follow, one
 call per target, and **only if the rename succeeded** — there is no point merging
@@ -123,7 +144,8 @@ Defaults live in `src/config/constants/faceLabel.constant.ts`.
 
 ## Required Immich API key permissions
 
-`person.read`, `person.update`, `person.merge`, `asset.read`, `asset.view` — see
+`person.read`, `person.update`, `person.create`, `person.merge`, `face.read`,
+`face.update`, `asset.read`, `asset.view` — see
 `FACE_LABEL_PERMISSIONS` in `src/config/permissions.ts`. A key created with the
 "All" checkbox covers these.
 

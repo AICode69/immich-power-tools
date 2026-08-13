@@ -39,7 +39,12 @@ export default function FaceLabelBoard() {
   const [mergeGroups, setMergeGroups] = useState(false);
   const [indexStatus, setIndexStatus] = useState<IFaceLabelIndexStatus | null>(null);
   const [buildingIndex, setBuildingIndex] = useState(false);
+  const [queueCounts, setQueueCounts] = useState<{
+    clusters: number;
+    unassigned: number;
+  } | null>(null);
   const [filters, setFilters] = useState<IFaceLabelQueueFilters>({
+    scope: "both",
     batchSize: DEFAULT_BATCH_SIZE,
     minFaceCount: DEFAULT_MIN_FACE_COUNT,
     similarityThreshold: DEFAULT_SIMILARITY_THRESHOLD,
@@ -58,6 +63,7 @@ export default function FaceLabelBoard() {
     listFaceLabelQueue(filters)
       .then((response) => {
         setGroups(response.groups);
+        setQueueCounts(response.counts ?? null);
         setDecisions({});
         setFocusedId(response.groups[0]?.id ?? null);
       })
@@ -152,6 +158,7 @@ export default function FaceLabelBoard() {
       const group = groups.find((g) => g.id === groupId);
       return {
         clusterIds: group?.clusterIds ?? [],
+        faceIds: group?.faceIds ?? [],
         action: decision.action,
         name: decision.name,
         targetPersonId: decision.targetPersonId,
@@ -222,15 +229,23 @@ export default function FaceLabelBoard() {
       return <div className="p-4 text-sm text-destructive">{errorMessage}</div>;
     }
     if (groups.length === 0) {
+      const nothingAnywhere =
+        queueCounts !== null && queueCounts.clusters === 0 && queueCounts.unassigned === 0;
       return (
         <div className="flex flex-col items-center justify-center gap-3 py-20 text-muted-foreground">
           <PartyPopper className="h-10 w-10 opacity-30" />
           <p className="text-sm">
-            Nothing left to label with these settings.
+            {nothingAnywhere
+              ? "Everything is labelled — no unnamed clusters and no unassigned faces."
+              : "Nothing matches these settings."}
           </p>
-          <p className="max-w-sm text-center text-xs">
-            Lower the minimum face count in Tuning to review smaller clusters.
-          </p>
+          {!nothingAnywhere && queueCounts && (
+            <p className="max-w-sm text-center text-xs">
+              {queueCounts.clusters} unnamed cluster(s) and {queueCounts.unassigned} unassigned
+              face(s) were found but filtered out. Try lowering the minimum face count,
+              or switching scope in Tuning.
+            </p>
+          )}
         </div>
       );
     }

@@ -6,7 +6,14 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { Button } from "@/components/ui/button";
-import { IFaceLabelQueueFilters } from "@/types/faceLabel";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { FaceLabelScope, IFaceLabelQueueFilters } from "@/types/faceLabel";
 import { SlidersHorizontal } from "lucide-react";
 import React from "react";
 
@@ -52,11 +59,32 @@ export default function FaceLabelFilters({ filters, onChange, disabled }: IProps
         </Button>
       </PopoverTrigger>
       <PopoverContent className="w-80 space-y-3" align="end">
+        <div className="space-y-1">
+          <Label className="text-xs">What to review</Label>
+          <Select
+            value={filters.scope ?? "both"}
+            onValueChange={(value) => onChange({ scope: value as FaceLabelScope })}
+          >
+            <SelectTrigger className="h-8">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="both">Everything</SelectItem>
+              <SelectItem value="unassigned">Unassigned faces only</SelectItem>
+              <SelectItem value="clusters">Unnamed clusters only</SelectItem>
+            </SelectContent>
+          </Select>
+          <p className="text-[11px] leading-tight text-muted-foreground">
+            Unassigned faces are the ones Immich never grouped into a person — it only
+            forms a group at 3+ similar faces, so everything below that is invisible in
+            Immich&apos;s own people view.
+          </p>
+        </div>
         {field("batchSize", "Batch size", "Groups reviewed at a time.", 1, 1, 100)}
         {field(
           "minFaceCount",
           "Minimum faces",
-          "Skip tiny clusters — usually blurry or partial faces.",
+          "Skip tiny clusters. Does not apply to unassigned faces — those are always single faces.",
           1,
           1,
           50

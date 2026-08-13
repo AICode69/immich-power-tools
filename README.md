@@ -12,7 +12,7 @@ A unofficial immich client to provide better tools to organize and manage your i
 ### 🎒Features
 - **Manage people data in bulk 👫**: Options to update people data in bulk, and with advance filters
 - **People Merge Suggestion 🎭**: Option to bulk merge people with suggested faces based on similarity.
-- **Power Face Label 🏷️**: Bulk-label unnamed people. Groups clusters that look like the same person, shows the face crop alongside the full photo, and ranks name suggestions using face similarity, learned filename/folder patterns, and who already appears in the photo. Review a batch, then apply it in one go. ([docs](./docs/POWER_FACE_LABEL.md))
+- **Power Face Label 🏷️**: Bulk-label faces, including the **unassigned faces Immich never grouped** (its recognition only forms a person at 3+ similar faces, so smaller ones never appear in Immich's people view). Groups faces that look like the same person, shows the face crop alongside the full photo, and ranks name suggestions using face similarity, learned filename/folder patterns, and who already appears in the photo. Review a batch, then apply it in one go. ([docs](./docs/POWER_FACE_LABEL.md))
 - **Update Missing Locations 📍**: Find assets in your library those are without location and update them with the location of the asset.
 - **Potential Albums 🖼️**: Find albums that are potential to be created based on the assets and people in your library.
 - **Analytics 📈**: Get analytics on your library like assets over time, exif data, etc.

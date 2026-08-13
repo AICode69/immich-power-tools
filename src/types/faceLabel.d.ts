@@ -7,7 +7,6 @@ export interface IFaceBoundingBox {
 
 export interface IFaceSample {
   faceId: string;
-  personId: string;
   assetId: string;
   /** Dimensions the detector ran on — the bounding box is in these coordinates. */
   imageWidth: number;
@@ -32,10 +31,20 @@ export interface IFaceLabelSuggestion {
   evidence: string[];
 }
 
+export type FaceLabelKind = "cluster" | "faces";
+
 export interface IFaceLabelGroup {
   id: string;
-  /** One or more unnamed people that look like the same person. */
+  /**
+   * "cluster" — unnamed person records Immich grouped but nobody named.
+   * "faces"   — faces Immich never grouped at all (below its minFaces
+   *             threshold), which have no person record yet.
+   */
+  kind: FaceLabelKind;
+  /** Person ids, when kind is "cluster". */
   clusterIds: string[];
+  /** Face ids, when kind is "faces". */
+  faceIds: string[];
   faceCount: number;
   sampleFaces: IFaceSample[];
   suggestions: IFaceLabelSuggestion[];
@@ -45,9 +54,13 @@ export interface IFaceLabelQueueResponse {
   groups: IFaceLabelGroup[];
   windowSize: number;
   hasMore: boolean;
+  counts: { clusters: number; unassigned: number };
 }
 
+export type FaceLabelScope = "both" | "clusters" | "unassigned";
+
 export interface IFaceLabelQueueFilters {
+  scope?: FaceLabelScope;
   batchSize?: number;
   minFaceCount?: number;
   similarityThreshold?: number;
@@ -58,7 +71,8 @@ export interface IFaceLabelQueueFilters {
 export type FaceLabelAction = "name" | "merge" | "hide" | "skip";
 
 export interface IFaceLabelApplyItem {
-  clusterIds: string[];
+  clusterIds?: string[];
+  faceIds?: string[];
   action: FaceLabelAction;
   name?: string;
   targetPersonId?: string;
@@ -72,6 +86,7 @@ export interface IFaceLabelApplyRequest {
 
 export interface IFaceLabelApplyResult {
   clusterIds: string[];
+  faceIds: string[];
   action: FaceLabelAction;
   status: "applied" | "partial" | "failed" | "skipped";
   error?: string;

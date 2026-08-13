@@ -43,6 +43,13 @@
       "when": 1786652774042,
       "tag": "0005_chilly_shooting_star",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1786663388741,
+      "tag": "0006_curious_shaman",
+      "breakpoints": true
     }
   ]
 }

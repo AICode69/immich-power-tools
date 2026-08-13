@@ -45,9 +45,11 @@ const FACES_PER_CLUSTER_FOR_TOKENS = 20;
 /** Albums larger than this are ignored for the social signal — too generic, too slow. */
 const MAX_ALBUM_SIZE_FOR_SOCIAL = 2000;
 
+type QueueScope = "both" | "clusters" | "unassigned";
+
 interface FaceRow {
   face_id: string;
-  person_id: string;
+  person_id: string | null;
   asset_id: string;
   image_width: number;
   image_height: number;
@@ -57,7 +59,24 @@ interface FaceRow {
   y2: number;
   original_file_name: string;
   original_path: string;
-  rn: number;
+}
+
+/**
+ * A reviewable unit of work.
+ *
+ * Two kinds, because Immich leaves unlabelled faces in two different states:
+ * clusters it grouped but nobody named, and faces it never grouped at all
+ * (its facial recognition only forms a person at `minFaces`, 3 by default —
+ * everything below that stays unassigned and is invisible to Immich's own
+ * people UI).
+ */
+interface Unit {
+  id: string;
+  kind: "cluster" | "faces";
+  clusterIds: string[];
+  faceIds: string[];
+  faces: FaceRow[];
+  faceCount: number;
 }
 
 const toNumber = (value: unknown, fallback: number) => {
@@ -73,10 +92,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }
 
     const ownerId = currentUser.id;
-    const batchSize = Math.min(
-      100,
-      toNumber(req.query.batchSize, DEFAULT_BATCH_SIZE)
-    );
+    const batchSize = Math.min(100, toNumber(req.query.batchSize, DEFAULT_BATCH_SIZE));
     const minFaceCount = toNumber(req.query.minFaceCount, DEFAULT_MIN_FACE_COUNT);
     const similarityThreshold = toNumber(
       req.query.similarityThreshold,
@@ -84,129 +100,136 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     );
     const groupThreshold = toNumber(req.query.groupThreshold, DEFAULT_GROUP_THRESHOLD);
     const page = Math.max(1, toNumber(req.query.page, 1));
+    const scope = ((req.query.scope as string) || "both") as QueueScope;
 
     // ---------------------------------------------------------------- skips
     const skipRows = await appDb
-      .select({ personId: faceLabelSkips.personId })
+      .select({ kind: faceLabelSkips.kind, targetId: faceLabelSkips.targetId })
       .from(faceLabelSkips)
       .where(eq(faceLabelSkips.ownerId, ownerId));
-    const skipIds = skipRows.map((row) => row.personId);
+    const skipClusterIds = skipRows.filter((r) => r.kind === "cluster").map((r) => r.targetId);
+    const skipFaceIds = skipRows.filter((r) => r.kind === "face").map((r) => r.targetId);
 
-    // ------------------------------------------------- 1. unnamed clusters
-    const clusters = await db
-      .select({
-        id: person.id,
-        faceAssetId: person.faceAssetId,
-        faceCount: count(assetFaces.id),
-      })
-      .from(person)
-      .innerJoin(
-        assetFaces,
-        and(
-          eq(assetFaces.personId, person.id),
-          isNull(assetFaces.deletedAt),
-          eq(assetFaces.isVisible, true)
-        )
-      )
-      .innerJoin(
-        assets,
-        and(
-          eq(assets.id, assetFaces.assetId),
-          isNull(assets.deletedAt),
-          eq(assets.status, "active")
-        )
-      )
-      .where(
-        and(
-          eq(person.ownerId, ownerId),
-          eq(person.name, ""),
-          eq(person.isHidden, false),
-          skipIds.length ? notInArray(person.id, skipIds) : undefined
-        )
-      )
-      .groupBy(person.id)
-      .having(gte(count(assetFaces.id), minFaceCount))
-      .orderBy(desc(count(assetFaces.id)), person.id)
-      .limit(CLUSTER_WINDOW_SIZE)
-      .offset((page - 1) * CLUSTER_WINDOW_SIZE);
+    const units: Unit[] = [];
+    let clusterWindow = 0;
+    let unassignedWindow = 0;
 
-    if (clusters.length === 0) {
-      return res.status(200).json({ groups: [], hasMore: false, windowSize: 0 });
+    // =================================================== A. unnamed clusters
+    if (scope !== "unassigned") {
+      const clusters = await db
+        .select({
+          id: person.id,
+          faceCount: count(assetFaces.id),
+        })
+        .from(person)
+        .innerJoin(
+          assetFaces,
+          and(
+            eq(assetFaces.personId, person.id),
+            isNull(assetFaces.deletedAt),
+            eq(assetFaces.isVisible, true)
+          )
+        )
+        .innerJoin(
+          assets,
+          and(
+            eq(assets.id, assetFaces.assetId),
+            isNull(assets.deletedAt),
+            eq(assets.status, "active")
+          )
+        )
+        .where(
+          and(
+            eq(person.ownerId, ownerId),
+            eq(person.name, ""),
+            eq(person.isHidden, false),
+            skipClusterIds.length ? notInArray(person.id, skipClusterIds) : undefined
+          )
+        )
+        .groupBy(person.id)
+        .having(gte(count(assetFaces.id), minFaceCount))
+        .orderBy(desc(count(assetFaces.id)), person.id)
+        .limit(CLUSTER_WINDOW_SIZE)
+        .offset((page - 1) * CLUSTER_WINDOW_SIZE);
+
+      clusterWindow = clusters.length;
+
+      if (clusters.length > 0) {
+        const clusterIds = clusters.map((c) => c.id);
+        const faceCountById = new Map(clusters.map((c) => [c.id, Number(c.faceCount)]));
+
+        const { rows: repRows } = await db.execute(sql`
+          SELECT DISTINCT ON (af."personId")
+                 af."personId" AS person_id,
+                 fs.embedding AS embedding
+          FROM asset_face af
+          JOIN face_search fs ON fs."faceId" = af.id
+          JOIN person p ON p.id = af."personId"
+          WHERE af."personId" = ANY(${clusterIds}::uuid[])
+            AND af."deletedAt" IS NULL
+            AND af."isVisible" IS TRUE
+          ORDER BY af."personId", (af.id = p."faceAssetId") DESC, af.id
+        `);
+
+        const representatives = new Map<string, number[]>();
+        for (const row of repRows as any[]) {
+          const embedding = parseEmbedding(row.embedding);
+          if (embedding) representatives.set(row.person_id, embedding);
+        }
+
+        // Clusters sharing a photo are different people, whatever the vectors say.
+        const blocked = new Set<string>();
+        const { rows: blockedRows } = await db.execute(sql`
+          SELECT DISTINCT af1."personId" AS a, af2."personId" AS b
+          FROM asset_face af1
+          JOIN asset_face af2
+            ON af2."assetId" = af1."assetId"
+           AND af2.id <> af1.id
+           AND af2."deletedAt" IS NULL
+           AND af2."isVisible" IS TRUE
+          WHERE af1."personId" = ANY(${clusterIds}::uuid[])
+            AND af2."personId" = ANY(${clusterIds}::uuid[])
+            AND af1."personId" < af2."personId"
+            AND af1."deletedAt" IS NULL
+            AND af1."isVisible" IS TRUE
+        `);
+        for (const row of blockedRows as any[]) {
+          blocked.add(blockedPairKey(row.a, row.b));
+        }
+
+        const grouped = groupClusters(clusterIds, representatives, {
+          threshold: groupThreshold,
+          minPairwise: GROUP_MIN_PAIRWISE_SIMILARITY,
+          maxSize: GROUP_MAX_SIZE,
+          blocked,
+        });
+
+        grouped.sort(
+          (a, b) =>
+            b.reduce((s, id) => s + (faceCountById.get(id) ?? 0), 0) -
+            a.reduce((s, id) => s + (faceCountById.get(id) ?? 0), 0)
+        );
+
+        for (const group of grouped) {
+          units.push({
+            id: `c:${group.slice().sort().join("+")}`,
+            kind: "cluster",
+            clusterIds: group,
+            faceIds: [],
+            faces: [],
+            faceCount: group.reduce((s, id) => s + (faceCountById.get(id) ?? 0), 0),
+          });
+        }
+      }
     }
 
-    const clusterIds = clusters.map((c) => c.id);
-    const faceCountById = new Map(clusters.map((c) => [c.id, Number(c.faceCount)]));
-
-    // ------------------------- 2. one representative embedding per cluster
-    const { rows: repRows } = await db.execute(sql`
-      SELECT DISTINCT ON (af."personId")
-             af."personId" AS person_id,
-             af.id AS face_id,
-             fs.embedding AS embedding
-      FROM asset_face af
-      JOIN face_search fs ON fs."faceId" = af.id
-      JOIN person p ON p.id = af."personId"
-      WHERE af."personId" = ANY(${clusterIds}::uuid[])
-        AND af."deletedAt" IS NULL
-        AND af."isVisible" IS TRUE
-      ORDER BY af."personId", (af.id = p."faceAssetId") DESC, af.id
-    `);
-
-    const representatives = new Map<string, number[]>();
-    for (const row of repRows as any[]) {
-      const embedding = parseEmbedding(row.embedding);
-      if (embedding) representatives.set(row.person_id, embedding);
-    }
-
-    // ------------------------ 3. pairs that cannot possibly be one person
-    // Two clusters with faces in the same photo are two different people, no
-    // matter how alike the embeddings look. Without this, grouping happily
-    // fuses siblings who are always photographed together.
-    const blockedPairs = new Set<string>();
-    const { rows: blockedRows } = await db.execute(sql`
-      SELECT DISTINCT af1."personId" AS a, af2."personId" AS b
-      FROM asset_face af1
-      JOIN asset_face af2
-        ON af2."assetId" = af1."assetId"
-       AND af2.id <> af1.id
-       AND af2."deletedAt" IS NULL
-       AND af2."isVisible" IS TRUE
-      WHERE af1."personId" = ANY(${clusterIds}::uuid[])
-        AND af2."personId" = ANY(${clusterIds}::uuid[])
-        AND af1."personId" < af2."personId"
-        AND af1."deletedAt" IS NULL
-        AND af1."isVisible" IS TRUE
-    `);
-    for (const row of blockedRows as any[]) {
-      blockedPairs.add(blockedPairKey(row.a, row.b));
-    }
-
-    // ----------------------------------- 4. group clusters that look alike
-    // Pairwise in JS: O(n^2 * 512) over a bounded window is a few milliseconds,
-    // far cheaper than one KNN round trip per cluster.
-    const grouped = groupClusters(clusterIds, representatives, {
-      threshold: groupThreshold,
-      minPairwise: GROUP_MIN_PAIRWISE_SIMILARITY,
-      maxSize: GROUP_MAX_SIZE,
-      blocked: blockedPairs,
-    });
-
-    grouped.sort((a, b) => {
-      const sizeA = a.reduce((sum, id) => sum + (faceCountById.get(id) ?? 0), 0);
-      const sizeB = b.reduce((sum, id) => sum + (faceCountById.get(id) ?? 0), 0);
-      return sizeB - sizeA;
-    });
-
-    const visibleGroups = grouped.slice(0, batchSize);
-    const visibleClusterIds = visibleGroups.flat();
-
-    // -------------------------------------- 5. sample faces for the groups
-    const { rows: faceRows } = await db.execute(sql`
-      SELECT face_id, person_id, asset_id, image_width, image_height,
-             x1, y1, x2, y2, original_file_name, original_path, rn
-      FROM (
+    // ================================================ B. unassigned faces
+    // These never became a person, so there is nothing for Immich's people UI
+    // to show and nothing to rename — each one has to be attached to a person.
+    if (scope !== "clusters" && units.length < batchSize) {
+      const { rows: faceRows } = await db.execute(sql`
         SELECT af.id AS face_id,
-               af."personId" AS person_id,
+               NULL::uuid AS person_id,
                af."assetId" AS asset_id,
                af."imageWidth" AS image_width,
                af."imageHeight" AS image_height,
@@ -216,47 +239,173 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
                af."boundingBoxY2" AS y2,
                a."originalFileName" AS original_file_name,
                a."originalPath" AS original_path,
-               row_number() OVER (PARTITION BY af."personId" ORDER BY af.id) AS rn
+               fs.embedding AS embedding
         FROM asset_face af
         JOIN asset a
           ON a.id = af."assetId"
          AND a."deletedAt" IS NULL
          AND a.status = 'active'
-        WHERE af."personId" = ANY(${visibleClusterIds}::uuid[])
+         AND a."ownerId" = ${ownerId}
+        JOIN face_search fs ON fs."faceId" = af.id
+        WHERE af."personId" IS NULL
           AND af."deletedAt" IS NULL
           AND af."isVisible" IS TRUE
-      ) ranked
-      WHERE rn <= ${FACES_PER_CLUSTER_FOR_TOKENS}
-    `);
+          ${
+            skipFaceIds.length
+              ? sql`AND NOT (af.id = ANY(${skipFaceIds}::uuid[]))`
+              : sql``
+          }
+        -- Biggest faces first: more pixels means a better embedding and a
+        -- crop the user can actually recognise.
+        ORDER BY ((af."boundingBoxX2" - af."boundingBoxX1")
+                * (af."boundingBoxY2" - af."boundingBoxY1")) DESC, af.id
+        LIMIT ${CLUSTER_WINDOW_SIZE}
+        OFFSET ${(page - 1) * CLUSTER_WINDOW_SIZE}
+      `);
 
-    const facesByCluster = new Map<string, FaceRow[]>();
-    for (const row of faceRows as unknown as FaceRow[]) {
-      const list = facesByCluster.get(row.person_id) ?? [];
-      list.push(row);
-      facesByCluster.set(row.person_id, list);
+      unassignedWindow = faceRows.length;
+
+      if (faceRows.length > 0) {
+        const rows = faceRows as any[];
+        const faceById = new Map<string, FaceRow>();
+        const embeddings = new Map<string, number[]>();
+        const assetByFace = new Map<string, string>();
+
+        for (const row of rows) {
+          faceById.set(row.face_id, row as FaceRow);
+          assetByFace.set(row.face_id, row.asset_id);
+          const embedding = parseEmbedding(row.embedding);
+          if (embedding) embeddings.set(row.face_id, embedding);
+        }
+
+        // Two faces in the same photo are two different people. No query
+        // needed — the asset id is already on the row.
+        const blocked = new Set<string>();
+        const byAsset = new Map<string, string[]>();
+        for (const [faceId, assetId] of Array.from(assetByFace.entries())) {
+          const list = byAsset.get(assetId) ?? [];
+          list.push(faceId);
+          byAsset.set(assetId, list);
+        }
+        for (const faceIds of Array.from(byAsset.values())) {
+          for (let i = 0; i < faceIds.length; i++) {
+            for (let j = i + 1; j < faceIds.length; j++) {
+              blocked.add(blockedPairKey(faceIds[i], faceIds[j]));
+            }
+          }
+        }
+
+        const faceIdsOrdered = rows.map((r) => r.face_id as string);
+        const grouped = groupClusters(faceIdsOrdered, embeddings, {
+          threshold: groupThreshold,
+          minPairwise: GROUP_MIN_PAIRWISE_SIMILARITY,
+          maxSize: GROUP_MAX_SIZE,
+          blocked,
+        });
+
+        grouped.sort((a, b) => b.length - a.length);
+
+        for (const group of grouped) {
+          units.push({
+            id: `f:${group.slice().sort().join("+")}`,
+            kind: "faces",
+            clusterIds: [],
+            faceIds: group,
+            faces: group.map((id) => faceById.get(id)!).filter(Boolean),
+            faceCount: group.length,
+          });
+        }
+      }
     }
 
-    // ------------------------------------------ 6. face-similarity signal
-    const probeFaceIds = visibleClusterIds.flatMap((id) =>
-      (facesByCluster.get(id) ?? [])
-        .slice(0, SAMPLE_FACES_PER_CLUSTER)
-        .map((face) => face.face_id)
+    if (units.length === 0) {
+      return res.status(200).json({
+        groups: [],
+        hasMore: false,
+        windowSize: 0,
+        counts: { clusters: clusterWindow, unassigned: unassignedWindow },
+      });
+    }
+
+    const visible = units.slice(0, batchSize);
+
+    // ------------------------------- sample faces for the cluster units
+    const visibleClusterIds = visible.flatMap((u) => u.clusterIds);
+    if (visibleClusterIds.length > 0) {
+      const { rows } = await db.execute(sql`
+        SELECT face_id, person_id, asset_id, image_width, image_height,
+               x1, y1, x2, y2, original_file_name, original_path
+        FROM (
+          SELECT af.id AS face_id,
+                 af."personId" AS person_id,
+                 af."assetId" AS asset_id,
+                 af."imageWidth" AS image_width,
+                 af."imageHeight" AS image_height,
+                 af."boundingBoxX1" AS x1,
+                 af."boundingBoxY1" AS y1,
+                 af."boundingBoxX2" AS x2,
+                 af."boundingBoxY2" AS y2,
+                 a."originalFileName" AS original_file_name,
+                 a."originalPath" AS original_path,
+                 row_number() OVER (PARTITION BY af."personId" ORDER BY af.id) AS rn
+          FROM asset_face af
+          JOIN asset a
+            ON a.id = af."assetId"
+           AND a."deletedAt" IS NULL
+           AND a.status = 'active'
+          WHERE af."personId" = ANY(${visibleClusterIds}::uuid[])
+            AND af."deletedAt" IS NULL
+            AND af."isVisible" IS TRUE
+        ) ranked
+        WHERE rn <= ${FACES_PER_CLUSTER_FOR_TOKENS}
+      `);
+
+      const byCluster = new Map<string, FaceRow[]>();
+      for (const row of rows as unknown as FaceRow[]) {
+        const list = byCluster.get(row.person_id as string) ?? [];
+        list.push(row);
+        byCluster.set(row.person_id as string, list);
+      }
+      for (const unit of visible) {
+        if (unit.kind !== "cluster") continue;
+        // Round-robin so every cluster in a group is represented.
+        const perCluster = unit.clusterIds.map((id) => byCluster.get(id) ?? []);
+        const interleaved: FaceRow[] = [];
+        for (let depth = 0; ; depth++) {
+          const before = interleaved.length;
+          for (const faces of perCluster) {
+            if (faces[depth]) interleaved.push(faces[depth]);
+          }
+          if (interleaved.length === before) break;
+        }
+        unit.faces = interleaved;
+      }
+    }
+
+    // ------------------------------------------------ signal inputs
+    const probeFaceIds = visible.flatMap((u) =>
+      u.faces.slice(0, SAMPLE_FACES_PER_CLUSTER).map((f) => f.face_id)
+    );
+    const unitByProbe = new Map<string, string>();
+    for (const unit of visible) {
+      for (const face of unit.faces.slice(0, SAMPLE_FACES_PER_CLUSTER)) {
+        unitByProbe.set(face.face_id, unit.id);
+      }
+    }
+    const allAssetIds = Array.from(
+      new Set(visible.flatMap((u) => u.faces.map((f) => f.asset_id)))
     );
 
+    // --------------------------------------------- 1. face similarity
     const faceScores = new Map<string, Map<string, { name: string; similarity: number }>>();
     if (probeFaceIds.length > 0) {
-      // The named-person filter sits inside the LATERAL so the HNSW index is
-      // used for `ORDER BY ... LIMIT k` rather than scanning every embedding.
       const { rows: knnRows } = await db.execute(sql`
         WITH probes AS (
-          SELECT fs."faceId" AS probe_face_id,
-                 af."personId" AS cluster_id,
-                 fs.embedding AS embedding
+          SELECT fs."faceId" AS probe_face_id, fs.embedding AS embedding
           FROM face_search fs
-          JOIN asset_face af ON af.id = fs."faceId"
           WHERE fs."faceId" = ANY(${probeFaceIds}::uuid[])
         )
-        SELECT probes.cluster_id,
+        SELECT probes.probe_face_id,
                nn.person_id,
                nn.name,
                max(nn.similarity) AS similarity
@@ -279,103 +428,98 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           LIMIT ${KNN_OVERFETCH}
         ) nn
         WHERE nn.similarity >= ${similarityThreshold}
-        GROUP BY probes.cluster_id, nn.person_id, nn.name
+        GROUP BY probes.probe_face_id, nn.person_id, nn.name
       `);
 
       for (const row of knnRows as any[]) {
-        const perCluster = faceScores.get(row.cluster_id) ?? new Map();
+        const unitId = unitByProbe.get(row.probe_face_id);
+        if (!unitId) continue;
+        const perUnit = faceScores.get(unitId) ?? new Map();
         const similarity = Number(row.similarity);
-        const existing = perCluster.get(row.person_id);
+        const existing = perUnit.get(row.person_id);
         if (!existing || existing.similarity < similarity) {
-          perCluster.set(row.person_id, { name: row.name, similarity });
+          perUnit.set(row.person_id, { name: row.name, similarity });
         }
-        faceScores.set(row.cluster_id, perCluster);
+        faceScores.set(unitId, perUnit);
       }
     }
 
-    // -------------------------------------- 7. same-asset co-occurrence
-    // Counted, not just flagged: one shared photo can be a collage or a
-    // photo-of-a-photo, but two independent co-appearances is proof that the
-    // cluster is somebody else.
-    const sameAsset = new Map<string, Map<string, number>>();
-    const { rows: sameAssetRows } = await db.execute(sql`
-      SELECT af."personId" AS cluster_id,
-             p2.id AS person_id,
-             count(DISTINCT af."assetId")::int AS shared
-      FROM asset_face af
-      JOIN asset_face af2
-        ON af2."assetId" = af."assetId"
-       AND af2.id <> af.id
-       AND af2."deletedAt" IS NULL
-       AND af2."isVisible" IS TRUE
-      JOIN person p2
-        ON p2.id = af2."personId"
-       AND p2."ownerId" = ${ownerId}
-       AND p2.name <> ''
-      WHERE af."personId" = ANY(${visibleClusterIds}::uuid[])
-        AND af."deletedAt" IS NULL
-        AND af."isVisible" IS TRUE
-      GROUP BY af."personId", p2.id
-    `);
-    for (const row of sameAssetRows as any[]) {
-      const perCluster = sameAsset.get(row.cluster_id) ?? new Map<string, number>();
-      perCluster.set(row.person_id, Number(row.shared));
-      sameAsset.set(row.cluster_id, perCluster);
-    }
-
-    // ------------------------------------------ 8. social-circle signal
-    const social = new Map<string, Map<string, number>>();
-    const { rows: socialRows } = await db.execute(sql`
-      WITH cluster_assets AS (
-        SELECT DISTINCT af."personId" AS cluster_id, af."assetId" AS asset_id
+    // --------------------------------- 2. who is already in these photos
+    const sameAssetPeople = new Map<string, Set<string>>();
+    const nameById = new Map<string, string>();
+    if (allAssetIds.length > 0) {
+      const { rows } = await db.execute(sql`
+        SELECT af."assetId" AS asset_id, p2.id AS person_id, p2.name AS name
         FROM asset_face af
-        WHERE af."personId" = ANY(${visibleClusterIds}::uuid[])
+        JOIN person p2
+          ON p2.id = af."personId"
+         AND p2."ownerId" = ${ownerId}
+         AND p2.name <> ''
+        WHERE af."assetId" = ANY(${allAssetIds}::uuid[])
           AND af."deletedAt" IS NULL
           AND af."isVisible" IS TRUE
-      ),
-      albums_of_interest AS (
-        SELECT ca.cluster_id, aa."albumId" AS album_id
-        FROM cluster_assets ca
-        JOIN album_asset aa ON aa."assetId" = ca.asset_id
-        GROUP BY ca.cluster_id, aa."albumId"
-      ),
-      album_sizes AS (
-        SELECT aa."albumId" AS album_id, count(*)::int AS n
-        FROM album_asset aa
-        WHERE aa."albumId" IN (SELECT album_id FROM albums_of_interest)
-        GROUP BY aa."albumId"
-      )
-      SELECT ai.cluster_id,
-             p2.id AS person_id,
-             count(DISTINCT af2."assetId")::int AS shared
-      FROM albums_of_interest ai
-      JOIN album_sizes s ON s.album_id = ai.album_id AND s.n <= ${MAX_ALBUM_SIZE_FOR_SOCIAL}
-      JOIN album_asset aa2 ON aa2."albumId" = ai.album_id
-      JOIN asset_face af2
-        ON af2."assetId" = aa2."assetId"
-       AND af2."deletedAt" IS NULL
-       AND af2."isVisible" IS TRUE
-      JOIN person p2
-        ON p2.id = af2."personId"
-       AND p2."ownerId" = ${ownerId}
-       AND p2.name <> ''
-      GROUP BY ai.cluster_id, p2.id
-    `);
-    for (const row of socialRows as any[]) {
-      const perCluster = social.get(row.cluster_id) ?? new Map<string, number>();
-      perCluster.set(row.person_id, Number(row.shared));
-      social.set(row.cluster_id, perCluster);
+        GROUP BY af."assetId", p2.id, p2.name
+      `);
+      for (const row of rows as any[]) {
+        const set = sameAssetPeople.get(row.asset_id) ?? new Set<string>();
+        set.add(row.person_id);
+        sameAssetPeople.set(row.asset_id, set);
+        nameById.set(row.person_id, row.name);
+      }
     }
 
-    // ------------------------------------------- 9. filename/folder signal
+    // ----------------------------------------------- 3. social circle
+    const socialShared = new Map<string, Map<string, number>>();
+    if (allAssetIds.length > 0) {
+      const { rows } = await db.execute(sql`
+        WITH albums_of_interest AS (
+          SELECT DISTINCT aa."albumId" AS album_id
+          FROM album_asset aa
+          WHERE aa."assetId" = ANY(${allAssetIds}::uuid[])
+        ),
+        album_sizes AS (
+          SELECT aa."albumId" AS album_id, count(*)::int AS n
+          FROM album_asset aa
+          WHERE aa."albumId" IN (SELECT album_id FROM albums_of_interest)
+          GROUP BY aa."albumId"
+        ),
+        source AS (
+          SELECT DISTINCT aa."assetId" AS asset_id, aa."albumId" AS album_id
+          FROM album_asset aa
+          WHERE aa."assetId" = ANY(${allAssetIds}::uuid[])
+        )
+        SELECT s.asset_id, p2.id AS person_id, p2.name AS name,
+               count(DISTINCT af2."assetId")::int AS shared
+        FROM source s
+        JOIN album_sizes sz ON sz.album_id = s.album_id AND sz.n <= ${MAX_ALBUM_SIZE_FOR_SOCIAL}
+        JOIN album_asset aa2 ON aa2."albumId" = s.album_id
+        JOIN asset_face af2
+          ON af2."assetId" = aa2."assetId"
+         AND af2."deletedAt" IS NULL
+         AND af2."isVisible" IS TRUE
+        JOIN person p2
+          ON p2.id = af2."personId"
+         AND p2."ownerId" = ${ownerId}
+         AND p2.name <> ''
+        GROUP BY s.asset_id, p2.id, p2.name
+      `);
+      for (const row of rows as any[]) {
+        const perAsset = socialShared.get(row.asset_id) ?? new Map<string, number>();
+        perAsset.set(row.person_id, Number(row.shared));
+        socialShared.set(row.asset_id, perAsset);
+        nameById.set(row.person_id, row.name);
+      }
+    }
+
+    // ------------------------------------- 4. filename / folder tokens
     const allTokens = new Set<string>();
-    const tokensByCluster = new Map<string, Map<string, Set<string>>>();
-    for (const clusterId of visibleClusterIds) {
+    const tokensByUnit = new Map<string, Map<string, Set<string>>>();
+    for (const unit of visible) {
       const perSource = new Map<string, Set<string>>([
         ["filename", new Set<string>()],
         ["folder", new Set<string>()],
       ]);
-      for (const face of facesByCluster.get(clusterId) ?? []) {
+      for (const face of unit.faces) {
         for (const token of filenameTokens(face.original_file_name)) {
           perSource.get("filename")!.add(token);
           allTokens.add(token);
@@ -385,7 +529,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           allTokens.add(token);
         }
       }
-      tokensByCluster.set(clusterId, perSource);
+      tokensByUnit.set(unit.id, perSource);
     }
 
     const tokenList = Array.from(allTokens);
@@ -396,10 +540,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         .select()
         .from(faceLabelTokens)
         .where(
-          and(
-            eq(faceLabelTokens.ownerId, ownerId),
-            inArray(faceLabelTokens.token, tokenList)
-          )
+          and(eq(faceLabelTokens.ownerId, ownerId), inArray(faceLabelTokens.token, tokenList))
         );
       for (const row of learned) {
         const key = `${row.source}:${row.token}`;
@@ -407,7 +548,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         list.push({ personId: row.personId, assetCount: row.assetCount });
         tokenStats.set(key, list);
       }
-
       const totals = await appDb
         .select()
         .from(faceLabelTokenTotals)
@@ -422,15 +562,27 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
     }
 
-    // -------------------------------------------- 10. combine into groups
-    const nameById = new Map<string, string>();
-    for (const perCluster of Array.from(faceScores.values())) {
-      for (const [personId, value] of Array.from(perCluster.entries())) {
+    // Names for people that only the token index knows about.
+    const tokenPersonIds = Array.from(
+      new Set(
+        Array.from(tokenStats.values()).flatMap((list) => list.map((s) => s.personId))
+      )
+    ).filter((id) => !nameById.has(id));
+    if (tokenPersonIds.length > 0) {
+      const rows = await db
+        .select({ id: person.id, name: person.name })
+        .from(person)
+        .where(and(eq(person.ownerId, ownerId), inArray(person.id, tokenPersonIds)));
+      for (const row of rows) nameById.set(row.id, row.name);
+    }
+    for (const perUnit of Array.from(faceScores.values())) {
+      for (const [personId, value] of Array.from(perUnit.entries())) {
         nameById.set(personId, value.name);
       }
     }
 
-    const groups = visibleGroups.map((clusterGroup) => {
+    // -------------------------------------------- 5. combine per unit
+    const groups = visible.map((unit) => {
       const candidates = new Map<
         string,
         {
@@ -459,75 +611,58 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         return candidate;
       };
 
-      const groupFaceTotal = clusterGroup.reduce(
-        (sum, id) => sum + (faceCountById.get(id) ?? 0),
-        0
-      );
+      for (const [personId, value] of Array.from(
+        (faceScores.get(unit.id) ?? new Map()).entries()
+      )) {
+        const candidate = ensure(personId);
+        candidate.faceScore = value.similarity;
+        candidate.evidence.push(`Face match ${(value.similarity * 100).toFixed(0)}%`);
+      }
 
-      for (const clusterId of clusterGroup) {
-        // Face similarity — best match across the group's clusters.
-        for (const [personId, value] of Array.from(
-          (faceScores.get(clusterId) ?? new Map()).entries()
-        )) {
-          const candidate = ensure(personId);
-          if (value.similarity > candidate.faceScore) {
-            candidate.faceScore = value.similarity;
-            candidate.evidence = candidate.evidence.filter(
-              (e) => !e.startsWith("Face match")
-            );
-            candidate.evidence.push(
-              `Face match ${(value.similarity * 100).toFixed(0)}%`
-            );
-          }
-        }
-
-        // Filename and folder tokens.
-        const perSource = tokensByCluster.get(clusterId);
-        if (perSource) {
-          for (const source of ["filename", "folder"] as const) {
-            for (const token of Array.from(perSource.get(source) ?? [])) {
-              const key = `${source}:${token}`;
-              const stats = tokenStats.get(key);
-              const total = tokenTotals.get(key);
-              if (!stats || !total) continue;
-              for (const stat of stats) {
-                const score = tokenAssociationScore(stat.assetCount, total);
-                if (score <= 0) continue;
-                const candidate = ensure(stat.personId);
-                if (score > candidate.filenameScore) {
-                  candidate.filenameScore = score;
-                  candidate.evidence = candidate.evidence.filter(
-                    (e) => !e.startsWith("Filename") && !e.startsWith("Folder")
-                  );
-                  candidate.evidence.push(
-                    `${source === "filename" ? "Filename" : "Folder"} "${token}": ${stat.assetCount} of ${total} labelled matches`
-                  );
-                }
+      const perSource = tokensByUnit.get(unit.id);
+      if (perSource) {
+        for (const source of ["filename", "folder"] as const) {
+          for (const token of Array.from(perSource.get(source) ?? [])) {
+            const key = `${source}:${token}`;
+            const stats = tokenStats.get(key);
+            const total = tokenTotals.get(key);
+            if (!stats || !total) continue;
+            for (const stat of stats) {
+              const score = tokenAssociationScore(stat.assetCount, total);
+              if (score <= 0) continue;
+              const candidate = ensure(stat.personId);
+              if (score > candidate.filenameScore) {
+                candidate.filenameScore = score;
+                candidate.evidence = candidate.evidence.filter(
+                  (e) => !e.startsWith("Filename") && !e.startsWith("Folder")
+                );
+                candidate.evidence.push(
+                  `${source === "filename" ? "Filename" : "Folder"} "${token}": ${stat.assetCount} of ${total} labelled matches`
+                );
               }
             }
           }
         }
+      }
 
-        // Social circle — shared albums.
-        for (const [personId, shared] of Array.from(
-          (social.get(clusterId) ?? new Map<string, number>()).entries()
+      for (const face of unit.faces) {
+        for (const personId of Array.from(
+          sameAssetPeople.get(face.asset_id) ?? new Set<string>()
         )) {
-          const candidate = ensure(personId);
-          const score = Math.min(1, shared / Math.max(1, groupFaceTotal));
-          if (score > candidate.socialScore) candidate.socialScore = score;
+          ensure(personId).sharedAssets += 1;
         }
-
-        // Same-asset appearance is close to a disqualification.
         for (const [personId, shared] of Array.from(
-          (sameAsset.get(clusterId) ?? new Map<string, number>()).entries()
+          (socialShared.get(face.asset_id) ?? new Map<string, number>()).entries()
         )) {
           const candidate = ensure(personId);
-          candidate.sharedAssets = Math.max(candidate.sharedAssets, shared);
+          candidate.socialScore = Math.max(
+            candidate.socialScore,
+            Math.min(1, shared / Math.max(1, unit.faceCount))
+          );
         }
       }
 
       const suggestions = Array.from(candidates.values())
-        // Two independent co-appearances means this is somebody else entirely.
         .filter((candidate) => candidate.sharedAssets < SAME_ASSET_HARD_DROP)
         .map((candidate) => {
           const confidence =
@@ -537,9 +672,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             (candidate.sharedAssets > 0 ? SAME_ASSET_PENALTY : 0);
 
           const evidence = [...candidate.evidence];
-          if (candidate.socialScore > 0) {
-            evidence.push("Appears in the same albums");
-          }
+          if (candidate.socialScore > 0) evidence.push("Appears in the same albums");
           if (candidate.sharedAssets > 0) {
             evidence.push("Already in the same photo — probably not this person");
           }
@@ -561,24 +694,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         .sort((a, b) => b.confidence - a.confidence)
         .slice(0, 6);
 
-      // Round-robin across the group's clusters rather than taking the first N
-      // faces: the point of a group is to check that every cluster in it really
-      // is the same person, which you cannot do if they are all from one.
-      const perCluster = clusterGroup.map((id) => facesByCluster.get(id) ?? []);
-      const interleaved: FaceRow[] = [];
-      for (let depth = 0; interleaved.length < SAMPLE_ASSETS_PER_GROUP; depth++) {
-        const before = interleaved.length;
-        for (const faces of perCluster) {
-          if (interleaved.length >= SAMPLE_ASSETS_PER_GROUP) break;
-          if (faces[depth]) interleaved.push(faces[depth]);
-        }
-        if (interleaved.length === before) break;
-      }
-
-      const sampleFaces = interleaved
-        .map((face) => ({
+      return {
+        id: unit.id,
+        kind: unit.kind,
+        clusterIds: unit.clusterIds,
+        faceIds: unit.faceIds,
+        faceCount: unit.faceCount,
+        sampleFaces: unit.faces.slice(0, SAMPLE_ASSETS_PER_GROUP).map((face) => ({
           faceId: face.face_id,
-          personId: face.person_id,
           assetId: face.asset_id,
           imageWidth: Number(face.image_width),
           imageHeight: Number(face.image_height),
@@ -588,24 +711,23 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             x2: Number(face.x2),
             y2: Number(face.y2),
           },
-        }));
-
-      return {
-        // Stable identity for the group across a batch.
-        id: clusterGroup.slice().sort().join("+"),
-        clusterIds: clusterGroup,
-        faceCount: groupFaceTotal,
-        sampleFaces,
+        })),
         suggestions,
       };
     });
 
     return res.status(200).json({
       groups,
-      windowSize: clusters.length,
-      hasMore: clusters.length === CLUSTER_WINDOW_SIZE || grouped.length > batchSize,
+      windowSize: clusterWindow + unassignedWindow,
+      hasMore:
+        units.length > batchSize ||
+        clusterWindow === CLUSTER_WINDOW_SIZE ||
+        unassignedWindow === CLUSTER_WINDOW_SIZE,
+      counts: { clusters: clusterWindow, unassigned: unassignedWindow },
     });
   } catch (error: any) {
-    return res.status(500).json({ error: error?.message ?? "Failed to build labelling queue" });
+    return res
+      .status(500)
+      .json({ error: error?.message ?? "Failed to build labelling queue" });
   }
 }

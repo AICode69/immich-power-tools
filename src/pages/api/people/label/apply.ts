@@ -5,27 +5,24 @@ import { appDb } from "@/db";
 import { faceLabelSkips } from "@/db/schema";
 import { getCurrentUser } from "@/handlers/serverUtils/user.utils";
 import { getUserHeaders } from "@/helpers/user.helper";
-import { person } from "@/schema";
-import { inArray } from "drizzle-orm";
+import { assetFaces, person } from "@/schema";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import type { NextApiRequest, NextApiResponse } from "next";
 
 type ApplyAction = "name" | "merge" | "hide" | "skip";
 
 interface ApplyItem {
-  clusterIds: string[];
+  /** Unnamed person clusters (kind "cluster"). */
+  clusterIds?: string[];
+  /** Unassigned faces (kind "faces") — no person row exists yet. */
+  faceIds?: string[];
   action: ApplyAction;
-  /** Required for "name": the new name to give the cluster(s). */
   name?: string;
-  /** Required for "merge": an existing person to absorb the cluster(s). */
   targetPersonId?: string;
 }
 
 interface ApplyRequest {
   items: ApplyItem[];
-  /**
-   * Merging is irreversible — Immich has no split — so grouped clusters are
-   * only renamed unless this is explicitly turned on.
-   */
   mergeGroups?: boolean;
   dryRun?: boolean;
 }
@@ -38,6 +35,7 @@ interface PlannedCall {
 
 interface ItemResult {
   clusterIds: string[];
+  faceIds: string[];
   action: ApplyAction;
   status: "applied" | "partial" | "failed" | "skipped";
   error?: string;
@@ -71,101 +69,96 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const results: ItemResult[] = [];
     const planned: PlannedCall[] = [];
 
+    const immich = (path: string, method: string, body: unknown) =>
+      fetch(`${ENV.IMMICH_URL}/api${path}`, {
+        method,
+        headers: getUserHeaders(currentUser),
+        body: JSON.stringify(body),
+      });
+
     // ------------------------------------------------------------- phase 0
     // Revalidate against the live database. The page may be minutes old, and
-    // this also makes a replayed request harmless: clusters that were already
-    // named are no longer eligible and get reported as skipped rather than
-    // renamed a second time or merged again.
+    // this makes a replayed request harmless: anything already handled is no
+    // longer eligible and gets reported as skipped rather than applied twice.
     const allClusterIds = Array.from(
       new Set(items.flatMap((item) => item.clusterIds ?? []))
     );
-    const liveRows = allClusterIds.length
+    const allFaceIds = Array.from(new Set(items.flatMap((item) => item.faceIds ?? [])));
+
+    const liveClusters = allClusterIds.length
       ? await db
-          .select({
-            id: person.id,
-            name: person.name,
-            ownerId: person.ownerId,
-          })
+          .select({ id: person.id, name: person.name, ownerId: person.ownerId })
           .from(person)
           .where(inArray(person.id, allClusterIds))
       : [];
-    const liveById = new Map(liveRows.map((row) => [row.id, row]));
+    const clusterById = new Map(liveClusters.map((row) => [row.id, row]));
 
-    const eligible = (clusterId: string) => {
-      const row = liveById.get(clusterId);
+    // A face is still workable only while it has no person attached.
+    const liveFaces = allFaceIds.length
+      ? await db
+          .select({ id: assetFaces.id })
+          .from(assetFaces)
+          .where(
+            and(
+              inArray(assetFaces.id, allFaceIds),
+              isNull(assetFaces.personId),
+              isNull(assetFaces.deletedAt)
+            )
+          )
+      : [];
+    const liveFaceIds = new Set(liveFaces.map((row) => row.id));
+
+    const eligibleCluster = (id: string) => {
+      const row = clusterById.get(id);
       return Boolean(row && row.ownerId === ownerId && row.name === "");
     };
 
-    // Items that survive validation, paired with the work they imply.
     const renameUpdates: { id: string; name: string }[] = [];
     const hideUpdates: { id: string; isHidden: boolean }[] = [];
     const mergeOps: { target: string; ids: string[]; itemIndex: number }[] = [];
-    const skipIds: string[] = [];
+    // Faces that need attaching to a person, resolved in phase 2.
+    const faceOps: {
+      itemIndex: number;
+      faceIds: string[];
+      targetPersonId?: string;
+      newName?: string;
+    }[] = [];
+    const skips: { kind: string; targetId: string }[] = [];
     const itemIndexByPersonId = new Map<string, number>();
 
     items.forEach((item, index) => {
-      const clusterIds = (item.clusterIds ?? []).filter(eligible);
+      const clusterIds = (item.clusterIds ?? []).filter(eligibleCluster);
+      const faceIds = (item.faceIds ?? []).filter((id) => liveFaceIds.has(id));
+      const isFaceItem = (item.faceIds ?? []).length > 0;
 
-      if (clusterIds.length === 0) {
+      const base = { clusterIds, faceIds, action: item.action };
+
+      if (clusterIds.length === 0 && faceIds.length === 0) {
         results[index] = {
-          clusterIds: item.clusterIds ?? [],
-          action: item.action,
+          ...base,
           status: "skipped",
-          error: "No longer unnamed, or not owned by this user",
+          error: isFaceItem
+            ? "Face is already assigned to someone"
+            : "No longer unnamed, or not owned by this user",
         };
         return;
       }
 
-      results[index] = { clusterIds, action: item.action, status: "applied" };
+      results[index] = { ...base, status: "applied" };
 
-      if (item.action === "name") {
-        const name = (item.name ?? "").trim();
-        if (!name) {
-          results[index] = {
-            clusterIds,
-            action: item.action,
-            status: "failed",
-            error: "A name is required",
-          };
-          return;
-        }
-        // Name every cluster in the group. That alone is fully reversible.
-        for (const id of clusterIds) {
-          renameUpdates.push({ id, name });
-          itemIndexByPersonId.set(id, index);
-        }
-        // Collapsing them into one person is not, so it is opt-in.
-        if (mergeGroups && clusterIds.length > 1) {
-          mergeOps.push({
-            target: clusterIds[0],
-            ids: clusterIds.slice(1),
-            itemIndex: index,
-          });
-        }
-        return;
-      }
-
-      if (item.action === "merge") {
-        if (!item.targetPersonId) {
-          results[index] = {
-            clusterIds,
-            action: item.action,
-            status: "failed",
-            error: "targetPersonId is required to merge",
-          };
-          return;
-        }
-        // The named person is always the merge target: merging the other way
-        // would discard their name, birthday, colour and chosen thumbnail.
-        mergeOps.push({
-          target: item.targetPersonId,
-          ids: clusterIds,
-          itemIndex: index,
-        });
+      if (item.action === "skip") {
+        for (const id of clusterIds) skips.push({ kind: "cluster", targetId: id });
+        for (const id of faceIds) skips.push({ kind: "face", targetId: id });
         return;
       }
 
       if (item.action === "hide") {
+        if (isFaceItem) {
+          // There is no person to hide, and deleting the face is destructive —
+          // skipping is the honest equivalent.
+          for (const id of faceIds) skips.push({ kind: "face", targetId: id });
+          return;
+        }
         for (const id of clusterIds) {
           hideUpdates.push({ id, isHidden: true });
           itemIndexByPersonId.set(id, index);
@@ -173,32 +166,55 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         return;
       }
 
-      if (item.action === "skip") {
-        skipIds.push(...clusterIds);
+      if (item.action === "merge") {
+        if (!item.targetPersonId) {
+          results[index] = { ...base, status: "failed", error: "targetPersonId is required" };
+          return;
+        }
+        if (faceIds.length > 0) {
+          faceOps.push({ itemIndex: index, faceIds, targetPersonId: item.targetPersonId });
+        }
+        if (clusterIds.length > 0) {
+          mergeOps.push({ target: item.targetPersonId, ids: clusterIds, itemIndex: index });
+        }
+        return;
+      }
+
+      // action === "name"
+      const name = (item.name ?? "").trim();
+      if (!name) {
+        results[index] = { ...base, status: "failed", error: "A name is required" };
+        return;
+      }
+
+      if (faceIds.length > 0) {
+        // Unassigned faces have no person record, so one has to be created.
+        faceOps.push({ itemIndex: index, faceIds, newName: name });
+      }
+
+      if (clusterIds.length > 0) {
+        for (const id of clusterIds) {
+          renameUpdates.push({ id, name });
+          itemIndexByPersonId.set(id, index);
+        }
+        if (mergeGroups && clusterIds.length > 1) {
+          mergeOps.push({ target: clusterIds[0], ids: clusterIds.slice(1), itemIndex: index });
+        }
       }
     });
 
     // ------------------------------------------------------------- phase 1
-    // One bulk call carries every rename and every hide.
+    // Renames and hides for existing person records: one bulk call.
     const peopleUpdates = [
       ...renameUpdates.map((u) => ({ id: u.id, name: u.name })),
       ...hideUpdates.map((u) => ({ id: u.id, isHidden: u.isHidden })),
     ];
 
     if (peopleUpdates.length > 0) {
-      planned.push({
-        method: "PUT",
-        path: "/api/people",
-        body: { people: peopleUpdates },
-      });
+      planned.push({ method: "PUT", path: "/api/people", body: { people: peopleUpdates } });
 
       if (!dryRun) {
-        const response = await fetch(`${ENV.IMMICH_URL}/api/people`, {
-          method: "PUT",
-          headers: getUserHeaders(currentUser),
-          body: JSON.stringify({ people: peopleUpdates }),
-        });
-
+        const response = await immich("/people", "PUT", { people: peopleUpdates });
         if (!response.ok) {
           const message = `Immich rejected the bulk update (HTTP ${response.status})`;
           for (const update of peopleUpdates) {
@@ -229,8 +245,57 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }
 
     // ------------------------------------------------------------- phase 2
-    // Merges run last, because they cannot be undone. If the rename failed we
-    // do not merge faces into a cluster we could not name.
+    // Attach unassigned faces to a person, creating one first when needed.
+    for (const op of faceOps) {
+      if (results[op.itemIndex]?.status === "failed") continue;
+
+      let personId = op.targetPersonId;
+
+      if (!personId) {
+        planned.push({ method: "POST", path: "/api/people", body: { name: op.newName } });
+        if (dryRun) {
+          personId = "<new-person-id>";
+        } else {
+          const created = await immich("/people", "POST", { name: op.newName });
+          if (!created.ok) {
+            results[op.itemIndex] = {
+              ...results[op.itemIndex],
+              status: "failed",
+              error: `Could not create the person (HTTP ${created.status})`,
+            };
+            continue;
+          }
+          personId = ((await created.json()) as { id: string }).id;
+        }
+      }
+
+      let failures = 0;
+      for (const faceId of op.faceIds) {
+        // PUT /faces/{personId} with {id: faceId} — the path parameter is the
+        // person, despite the route name. Verified against Immich's
+        // PersonService.reassignFacesById(auth, personId, dto).
+        planned.push({
+          method: "PUT",
+          path: `/api/faces/${personId}`,
+          body: { id: faceId },
+        });
+        if (dryRun) continue;
+
+        const response = await immich(`/faces/${personId}`, "PUT", { id: faceId });
+        if (!response.ok) failures += 1;
+      }
+
+      if (failures > 0) {
+        results[op.itemIndex] = {
+          ...results[op.itemIndex],
+          status: failures === op.faceIds.length ? "failed" : "partial",
+          error: `${failures} of ${op.faceIds.length} face(s) could not be assigned`,
+        };
+      }
+    }
+
+    // ------------------------------------------------------------- phase 3
+    // Merges last, because they cannot be undone.
     for (const op of mergeOps) {
       if (results[op.itemIndex]?.status === "failed") continue;
 
@@ -240,18 +305,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           path: `/api/people/${op.target}/merge`,
           body: { ids },
         });
-
         if (dryRun) continue;
 
-        const response = await fetch(
-          `${ENV.IMMICH_URL}/api/people/${op.target}/merge`,
-          {
-            method: "POST",
-            headers: getUserHeaders(currentUser),
-            body: JSON.stringify({ ids }),
-          }
-        );
-
+        const response = await immich(`/people/${op.target}/merge`, "POST", { ids });
         if (!response.ok) {
           results[op.itemIndex] = {
             ...results[op.itemIndex],
@@ -262,11 +318,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
     }
 
-    // ------------------------------------------------------------- phase 3
-    if (skipIds.length > 0 && !dryRun) {
+    // ------------------------------------------------------------- phase 4
+    if (skips.length > 0 && !dryRun) {
       await appDb
         .insert(faceLabelSkips)
-        .values(skipIds.map((personId) => ({ ownerId, personId })))
+        .values(skips.map((s) => ({ ownerId, kind: s.kind, targetId: s.targetId })))
         .onConflictDoNothing();
     }
 
