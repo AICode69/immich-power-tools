@@ -1,5 +1,8 @@
 import {
+  NAME_MATCH_MIN_PREFIX,
+  NAME_MATCH_SCORES,
   TOKEN_DATELIKE_PATTERN,
+  TOKEN_HEXLIKE_PATTERN,
   TOKEN_MIN_LENGTH,
   TOKEN_MIN_LIFT,
   TOKEN_NUMERIC_PATTERN,
@@ -10,15 +13,63 @@ import {
 
 /**
  * Token splitting must stay identical on both sides of the feature: the index
- * build splits in Postgres with `regexp_split_to_table(..., '[^A-Za-z0-9]+')`
- * and the queue splits here. Same expression, same lowercasing — otherwise
- * learned tokens never match the ones we look up.
+ * build splits in Postgres and the queue splits here. Same boundaries, same
+ * squeeze, same lowercasing — otherwise learned tokens never match the ones we
+ * look up. `SQL_TOKEN_EXPANSION` below is the Postgres twin of
+ * `expandBoundaries`; change one and you must change the other.
  */
 export const TOKEN_SPLIT_REGEX = /[^A-Za-z0-9]+/;
 
 /** Strip a trailing file extension, if there is one. */
 export const stripExtension = (fileName: string): string =>
   fileName.replace(/\.[^.]*$/, "");
+
+/**
+ * Insert split points that punctuation alone misses.
+ *
+ * Real libraries name files every possible way, and a single unsplit token is
+ * a token that never matches anything:
+ *
+ *   TaylorMorgan2024 -> Taylor Morgan 2024
+ *   IMGTaylor01      -> IMG Taylor 01
+ *   HTMLParser       -> HTML Parser
+ *
+ * Order matters — the acronym rule has to run before the plain camelCase rule,
+ * or `HTMLParser` becomes `HTMLP arser`.
+ */
+export const expandBoundaries = (value: string): string =>
+  value
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Za-z])([0-9])/g, "$1 $2")
+    .replace(/([0-9])([A-Za-z])/g, "$1 $2");
+
+/**
+ * Collapse runs of three or more identical characters.
+ *
+ * Social exports and handles pad names for effect — `taylorrr__export_*.jpg`,
+ * `taaaaylor_2024.jpg`. Squeezing lets those reach the same token as the
+ * ordinary spelling. Runs of two are left alone so `taylor` stays `taylor`.
+ */
+export const squeezeRepeats = (token: string): string =>
+  token.replace(/(.)\1{2,}/g, "$1");
+
+/**
+ * Postgres equivalent of `expandBoundaries`, as a SQL expression over `expr`.
+ * Kept here so the two definitions sit side by side.
+ */
+export const SQL_TOKEN_EXPANSION = (expr: string): string => `
+  regexp_replace(
+    regexp_replace(
+      regexp_replace(
+        regexp_replace(${expr}, '([A-Z]+)([A-Z][a-z])', '\\1 \\2', 'g'),
+        '([a-z0-9])([A-Z])', '\\1 \\2', 'g'),
+      '([A-Za-z])([0-9])', '\\1 \\2', 'g'),
+    '([0-9])([A-Za-z])', '\\1 \\2', 'g')`;
+
+/** Postgres equivalent of `squeezeRepeats`, as a SQL expression over `expr`. */
+export const SQL_TOKEN_SQUEEZE = (expr: string): string =>
+  `regexp_replace(${expr}, '(.)\\1{2,}', '\\1', 'g')`;
 
 /**
  * External libraries mounted from Windows hosts store backslash paths, so
@@ -43,14 +94,29 @@ export const isUsefulToken = (token: string): boolean => {
   if (TOKEN_NUMERIC_PATTERN.test(token)) return false;
   if (TOKEN_DATELIKE_PATTERN.test(token)) return false;
   if (TOKEN_RESOLUTION_PATTERN.test(token)) return false;
+  // Content hashes and uuid fragments look like words to the splitter but are
+  // unique per asset, so they only bloat the index.
+  if (TOKEN_HEXLIKE_PATTERN.test(token) && /\d/.test(token)) return false;
   return true;
 };
 
-const splitTokens = (value: string): string[] =>
-  value
-    .split(TOKEN_SPLIT_REGEX)
-    .map((t) => t.toLowerCase())
-    .filter(isUsefulToken);
+/**
+ * Split a filename or folder name into the tokens worth learning from.
+ *
+ * Emits the plain token and, when squeezing changes it, the squeezed form too,
+ * so `taylorrr` reaches the same token as `taylor` without losing the
+ * literal spelling.
+ */
+const splitTokens = (value: string): string[] => {
+  const out = new Set<string>();
+  for (const part of expandBoundaries(value).split(TOKEN_SPLIT_REGEX)) {
+    const token = part.toLowerCase();
+    if (isUsefulToken(token)) out.add(token);
+    const squeezed = squeezeRepeats(token);
+    if (squeezed !== token && isUsefulToken(squeezed)) out.add(squeezed);
+  }
+  return Array.from(out);
+};
 
 /** Useful filename tokens for an asset (extension already removed). */
 export const filenameTokens = (originalFileName: string): string[] =>
@@ -59,6 +125,20 @@ export const filenameTokens = (originalFileName: string): string[] =>
 /** Useful folder tokens for an asset. */
 export const folderTokens = (originalPath: string): string[] =>
   splitTokens(parentFolderName(originalPath || ""));
+
+/**
+ * Tokens for a person's name, used to match names that appear literally in
+ * filenames. Squeezed the same way filename tokens are, so both sides meet.
+ */
+export const personNameTokens = (name: string): string[] => {
+  const out = new Set<string>();
+  for (const part of expandBoundaries(name || "").split(TOKEN_SPLIT_REGEX)) {
+    const token = part.toLowerCase();
+    if (token.length < TOKEN_MIN_LENGTH) continue;
+    out.add(squeezeRepeats(token));
+  }
+  return Array.from(out);
+};
 
 /**
  * Wilson lower bound (95%) on the observed precision.
@@ -114,6 +194,108 @@ export const tokenAssociationScore = (
     Math.log2(1 + matchingAssets) / Math.log2(1 + TOKEN_SATURATION_SUPPORT)
   );
   return wilson * supportWeight;
+};
+
+export interface PersonNameIndex {
+  /** Name token -> ids of every person carrying it. */
+  byToken: Map<string, string[]>;
+  /** Person id -> the tokens of their own name. */
+  tokensByPerson: Map<string, string[]>;
+}
+
+/**
+ * Index named people by the tokens of their names.
+ *
+ * The learned token index can only speak about filenames that already sit next
+ * to a labelled face, so it is silent on a person whose photos are all
+ * unlabelled — exactly the cold-start case this feature exists for. Matching
+ * filenames against the names Immich already knows costs one small query and
+ * covers it.
+ */
+export const buildPersonNameIndex = (
+  people: { id: string; name: string }[]
+): PersonNameIndex => {
+  const byToken = new Map<string, string[]>();
+  const tokensByPerson = new Map<string, string[]>();
+
+  for (const person of people) {
+    const tokens = personNameTokens(person.name).filter(
+      (token) => !TOKEN_STOP_WORDS.has(token)
+    );
+    if (tokens.length === 0) continue;
+    tokensByPerson.set(person.id, tokens);
+    for (const token of tokens) {
+      const list = byToken.get(token) ?? [];
+      if (!list.includes(person.id)) list.push(person.id);
+      byToken.set(token, list);
+    }
+  }
+
+  return { byToken, tokensByPerson };
+};
+
+export interface NameMatch {
+  score: number;
+  /** The filename/folder token that produced the match. */
+  token: string;
+  exact: boolean;
+}
+
+/**
+ * Score how strongly a set of filename/folder tokens names a known person.
+ *
+ * A token shared by several people is divided between them, so a common family
+ * name never outranks a distinctive given name. Matching every prefix of the
+ * token rather than scanning all names keeps this linear in token length.
+ */
+export const matchNamesInTokens = (
+  tokens: string[],
+  index: PersonNameIndex
+): Map<string, NameMatch> => {
+  const matches = new Map<string, NameMatch>();
+
+  const record = (personId: string, score: number, token: string, exact: boolean) => {
+    const existing = matches.get(personId);
+    if (!existing || existing.score < score) {
+      matches.set(personId, { score, token, exact });
+    }
+  };
+
+  const seenTokens = new Set<string>();
+
+  for (const raw of tokens) {
+    const token = squeezeRepeats(raw);
+    if (token.length < TOKEN_MIN_LENGTH || TOKEN_STOP_WORDS.has(token)) continue;
+    seenTokens.add(token);
+
+    const exactPeople = index.byToken.get(token);
+    if (exactPeople) {
+      const share = NAME_MATCH_SCORES.exact / exactPeople.length;
+      for (const personId of exactPeople) record(personId, share, token, true);
+    }
+
+    // `taylorrr` -> `taylor`, `taylors` -> `taylor`. Only prefixes long
+    // enough to be a name are considered.
+    for (let length = NAME_MATCH_MIN_PREFIX; length < token.length; length++) {
+      const prefix = token.slice(0, length);
+      const people = index.byToken.get(prefix);
+      if (!people) continue;
+      const share = NAME_MATCH_SCORES.prefix / people.length;
+      for (const personId of people) record(personId, share, token, false);
+    }
+  }
+
+  // Every part of the name present at once ("taylor" and "morgan") is far
+  // stronger evidence than either half alone.
+  for (const [personId, match] of Array.from(matches.entries())) {
+    const nameTokens = index.tokensByPerson.get(personId);
+    if (!nameTokens || nameTokens.length < 2) continue;
+    if (nameTokens.every((token) => seenTokens.has(token))) {
+      matches.set(personId, { ...match, score: NAME_MATCH_SCORES.fullName });
+    }
+  }
+
+  return matches;
 };
 
 /** Cosine similarity between two equal-length embedding vectors. */

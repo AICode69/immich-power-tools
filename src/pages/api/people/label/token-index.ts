@@ -12,7 +12,12 @@ import {
   faceLabelTokens,
 } from "@/db/schema";
 import { getCurrentUser } from "@/handlers/serverUtils/user.utils";
-import { isUsefulToken, passesLiftGate } from "@/helpers/faceLabel.helper";
+import {
+  SQL_TOKEN_EXPANSION,
+  SQL_TOKEN_SQUEEZE,
+  isUsefulToken,
+  passesLiftGate,
+} from "@/helpers/faceLabel.helper";
 import { eq, sql } from "drizzle-orm";
 import type { NextApiRequest, NextApiResponse } from "next";
 
@@ -66,20 +71,31 @@ const buildTokenIndex = async (ownerId: string) => {
         AND a."deletedAt" IS NULL
         AND a.status = 'active'
     ),
-    tokens AS (
+    raw_tokens AS (
       SELECT o.id AS asset_id, 'filename' AS source, lower(tok) AS token
       FROM owned o
       CROSS JOIN LATERAL regexp_split_to_table(
-        regexp_replace(o.file_name, '[.][^.]*$', ''),
+        ${sql.raw(SQL_TOKEN_EXPANSION(`regexp_replace(o.file_name, '[.][^.]*$', '')`))},
         '[^A-Za-z0-9]+'
       ) AS tok
       UNION
       SELECT o.id AS asset_id, 'folder' AS source, lower(tok) AS token
       FROM owned o
       CROSS JOIN LATERAL regexp_split_to_table(
-        regexp_replace(regexp_replace(o.file_path, '/[^/]*$', ''), '^.*/', ''),
+        ${sql.raw(
+          SQL_TOKEN_EXPANSION(
+            `regexp_replace(regexp_replace(o.file_path, '/[^/]*$', ''), '^.*/', '')`
+          )
+        )},
         '[^A-Za-z0-9]+'
       ) AS tok
+    ),
+    -- Squeezed variants alongside the literal ones, matching splitTokens() in
+    -- faceLabel.helper.ts. UNION dedupes where squeezing changed nothing.
+    tokens AS (
+      SELECT asset_id, source, token FROM raw_tokens
+      UNION
+      SELECT asset_id, source, ${sql.raw(SQL_TOKEN_SQUEEZE("token"))} FROM raw_tokens
     ),
     named_faces AS (
       SELECT DISTINCT af."assetId" AS asset_id, af."personId" AS person_id

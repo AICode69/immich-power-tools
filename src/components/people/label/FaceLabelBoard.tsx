@@ -1,11 +1,12 @@
 import PageLayout from "@/components/layouts/PageLayout";
 import Header from "@/components/shared/Header";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import Loader from "@/components/ui/loader";
 import {
-  DEFAULT_BATCH_SIZE,
   DEFAULT_GROUP_THRESHOLD,
   DEFAULT_MIN_FACE_COUNT,
+  DEFAULT_PAGE_SIZE,
   DEFAULT_SIMILARITY_THRESHOLD,
 } from "@/config/constants/faceLabel.constant";
 import {
@@ -20,36 +21,51 @@ import {
   IFaceLabelIndexStatus,
   IFaceLabelQueueFilters,
 } from "@/types/faceLabel";
-import { PartyPopper, ScanFace } from "lucide-react";
+import { PartyPopper, ScanFace, Search, X } from "lucide-react";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import toast from "react-hot-toast";
+import BulkAssignBar from "./BulkAssignBar";
 import ClusterCard, { IClusterDecision } from "./ClusterCard";
 import DuplicatePeopleDialog from "./DuplicatePeopleDialog";
 import FaceLabelFilters from "./FaceLabelFilters";
 import LabelApplyBar from "./LabelApplyBar";
+import QueuePager from "./QueuePager";
 import TokenIndexCard from "./TokenIndexCard";
+
+/** How long to wait after the last keystroke before searching. */
+const SEARCH_DEBOUNCE_MS = 400;
 
 export default function FaceLabelBoard() {
   const [groups, setGroups] = useState<IFaceLabelGroup[]>([]);
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [decisions, setDecisions] = useState<Record<string, IClusterDecision>>({});
+  /** Group id -> faces the user unticked in the review dialog. */
+  const [excluded, setExcluded] = useState<Record<string, string[]>>({});
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const [applying, setApplying] = useState(false);
   const [mergeGroups, setMergeGroups] = useState(false);
   const [indexStatus, setIndexStatus] = useState<IFaceLabelIndexStatus | null>(null);
   const [buildingIndex, setBuildingIndex] = useState(false);
+  const [searchInput, setSearchInput] = useState("");
+  const [pageInfo, setPageInfo] = useState({
+    page: 1,
+    pageSize: DEFAULT_PAGE_SIZE,
+    total: 0,
+    totalPages: 1,
+  });
   const [queueCounts, setQueueCounts] = useState<{
     clusters: number;
     unassigned: number;
   } | null>(null);
   const [filters, setFilters] = useState<IFaceLabelQueueFilters>({
     scope: "both",
-    batchSize: DEFAULT_BATCH_SIZE,
+    pageSize: DEFAULT_PAGE_SIZE,
     minFaceCount: DEFAULT_MIN_FACE_COUNT,
     similarityThreshold: DEFAULT_SIMILARITY_THRESHOLD,
     groupThreshold: DEFAULT_GROUP_THRESHOLD,
     page: 1,
+    search: "",
   });
 
   const groupsRef = useRef<IFaceLabelGroup[]>([]);
@@ -64,7 +80,14 @@ export default function FaceLabelBoard() {
       .then((response) => {
         setGroups(response.groups);
         setQueueCounts(response.counts ?? null);
+        setPageInfo({
+          page: response.page,
+          pageSize: response.pageSize,
+          total: response.total,
+          totalPages: response.totalPages,
+        });
         setDecisions({});
+        setExcluded({});
         setFocusedId(response.groups[0]?.id ?? null);
       })
       .catch((error) => setErrorMessage(error.message))
@@ -74,6 +97,16 @@ export default function FaceLabelBoard() {
   useEffect(() => {
     fetchQueue();
   }, [fetchQueue]);
+
+  // Searching on every keystroke would fire a fairly heavy query per letter.
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setFilters((prev) =>
+        prev.search === searchInput ? prev : { ...prev, search: searchInput, page: 1 }
+      );
+    }, SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [searchInput]);
 
   useEffect(() => {
     getTokenIndexStatus()
@@ -101,6 +134,15 @@ export default function FaceLabelBoard() {
     setDecisions((prev) => {
       const next = { ...prev };
       if (decision) next[groupId] = decision;
+      else delete next[groupId];
+      return next;
+    });
+  };
+
+  const setExcludedFor = (groupId: string, faceIds: string[]) => {
+    setExcluded((prev) => {
+      const next = { ...prev };
+      if (faceIds.length > 0) next[groupId] = faceIds;
       else delete next[groupId];
       return next;
     });
@@ -153,12 +195,22 @@ export default function FaceLabelBoard() {
     return () => window.removeEventListener("keydown", handler);
   }, []);
 
+  const applyToEveryGroup = (decision: IClusterDecision) => {
+    setDecisions(
+      Object.fromEntries(groups.map((group) => [group.id, decision]))
+    );
+    toast.success(
+      `${groups.length} group(s) set — review the cards, then press Apply`
+    );
+  };
+
   const buildItems = (): IFaceLabelApplyItem[] =>
     Object.entries(decisions).map(([groupId, decision]) => {
       const group = groups.find((g) => g.id === groupId);
       return {
         clusterIds: group?.clusterIds ?? [],
         faceIds: group?.faceIds ?? [],
+        excludedFaceIds: excluded[groupId] ?? [],
         action: decision.action,
         name: decision.name,
         targetPersonId: decision.targetPersonId,
@@ -229,22 +281,36 @@ export default function FaceLabelBoard() {
       return <div className="p-4 text-sm text-destructive">{errorMessage}</div>;
     }
     if (groups.length === 0) {
+      const searching = Boolean(filters.search);
       const nothingAnywhere =
-        queueCounts !== null && queueCounts.clusters === 0 && queueCounts.unassigned === 0;
+        !searching &&
+        queueCounts !== null &&
+        queueCounts.clusters === 0 &&
+        queueCounts.unassigned === 0;
       return (
         <div className="flex flex-col items-center justify-center gap-3 py-20 text-muted-foreground">
           <PartyPopper className="h-10 w-10 opacity-30" />
           <p className="text-sm">
-            {nothingAnywhere
-              ? "Everything is labelled — no unnamed clusters and no unassigned faces."
-              : "Nothing matches these settings."}
+            {searching
+              ? `Nothing unlabelled matches "${filters.search}".`
+              : nothingAnywhere
+                ? "Everything is labelled — no unnamed clusters and no unassigned faces."
+                : "Nothing matches these settings."}
           </p>
-          {!nothingAnywhere && queueCounts && (
+          {searching ? (
             <p className="max-w-sm text-center text-xs">
-              {queueCounts.clusters} unnamed cluster(s) and {queueCounts.unassigned} unassigned
-              face(s) were found but filtered out. Try lowering the minimum face count,
-              or switching scope in Tuning.
+              The search covers the original filename and folder path of
+              unlabelled faces only — anything already named will not appear.
             </p>
+          ) : (
+            !nothingAnywhere &&
+            queueCounts && (
+              <p className="max-w-sm text-center text-xs">
+                {queueCounts.clusters} unnamed cluster(s) and {queueCounts.unassigned}{" "}
+                unassigned face(s) were found but filtered out. Try lowering the
+                minimum face count, or switching scope in Tuning.
+              </p>
+            )
           )}
         </div>
       );
@@ -257,9 +323,11 @@ export default function FaceLabelBoard() {
             key={group.id}
             group={group}
             decision={decisions[group.id]}
+            excludedFaceIds={excluded[group.id]}
             focused={focusedId === group.id}
             onFocus={() => setFocusedId(group.id)}
             onChange={(decision) => setDecision(group.id, decision)}
+            onExcludedChange={(faceIds) => setExcludedFor(group.id, faceIds)}
           />
         ))}
       </div>
@@ -292,15 +360,72 @@ export default function FaceLabelBoard() {
         }
       />
 
-      <div className="p-3 pb-0">
+      <div className="space-y-3 p-3 pb-0">
         <TokenIndexCard
           status={indexStatus}
           building={buildingIndex}
           onRebuild={handleRebuildIndex}
         />
+
+        <div className="relative">
+          <Search className="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            value={searchInput}
+            onChange={(event) => setSearchInput(event.target.value)}
+            placeholder="Search unlabelled faces by filename or folder — e.g. taylor"
+            className="pl-9 pr-9"
+          />
+          {searchInput && (
+            <button
+              type="button"
+              onClick={() => setSearchInput("")}
+              title="Clear search"
+              className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          )}
+        </div>
+
+        {!loading && (
+          <QueuePager
+            page={pageInfo.page}
+            totalPages={pageInfo.totalPages}
+            total={pageInfo.total}
+            pageSize={pageInfo.pageSize}
+            groupCount={groups.length}
+            disabled={loading}
+            onPageChange={(page) => setFilters((prev) => ({ ...prev, page }))}
+          />
+        )}
+
+        {!loading && groups.length > 0 && (
+          <BulkAssignBar
+            groupCount={groups.length}
+            search={filters.search}
+            onAssignAll={(personId, name) =>
+              applyToEveryGroup({ action: "merge", targetPersonId: personId, name })
+            }
+            onNameAll={(name) => applyToEveryGroup({ action: "name", name })}
+          />
+        )}
       </div>
 
       {renderContent()}
+
+      {!loading && groups.length > 0 && pageInfo.totalPages > 1 && (
+        <div className="px-3 pb-3">
+          <QueuePager
+            page={pageInfo.page}
+            totalPages={pageInfo.totalPages}
+            total={pageInfo.total}
+            pageSize={pageInfo.pageSize}
+            groupCount={groups.length}
+            disabled={loading}
+            onPageChange={(page) => setFilters((prev) => ({ ...prev, page }))}
+          />
+        </div>
+      )}
 
       <LabelApplyBar
         namedCount={counts.named}
@@ -312,7 +437,10 @@ export default function FaceLabelBoard() {
         onMergeGroupsChange={setMergeGroups}
         onPreview={handlePreview}
         onApply={handleApply}
-        onClear={() => setDecisions({})}
+        onClear={() => {
+          setDecisions({});
+          setExcluded({});
+        }}
       />
     </PageLayout>
   );

@@ -80,7 +80,14 @@ export default function FaceLabelFilters({ filters, onChange, disabled }: IProps
             Immich&apos;s own people view.
           </p>
         </div>
-        {field("batchSize", "Batch size", "Groups reviewed at a time.", 1, 1, 100)}
+        {field(
+          "pageSize",
+          "Page size",
+          "Clusters and faces scanned per page. Grouping only happens within a page, so a bigger page groups better but loads slower.",
+          10,
+          1,
+          300
+        )}
         {field(
           "minFaceCount",
           "Minimum faces",

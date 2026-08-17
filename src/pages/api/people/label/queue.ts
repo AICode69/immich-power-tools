@@ -1,12 +1,12 @@
 import {
-  CLUSTER_WINDOW_SIZE,
-  DEFAULT_BATCH_SIZE,
   DEFAULT_GROUP_THRESHOLD,
   DEFAULT_MIN_FACE_COUNT,
+  DEFAULT_PAGE_SIZE,
   DEFAULT_SIMILARITY_THRESHOLD,
   GROUP_MAX_SIZE,
   GROUP_MIN_PAIRWISE_SIMILARITY,
   KNN_OVERFETCH,
+  MAX_PAGE_SIZE,
   SAMPLE_ASSETS_PER_GROUP,
   SAMPLE_FACES_PER_CLUSTER,
   SAME_ASSET_HARD_DROP,
@@ -19,24 +19,16 @@ import { faceLabelSkips, faceLabelTokenTotals, faceLabelTokens } from "@/db/sche
 import { getCurrentUser } from "@/handlers/serverUtils/user.utils";
 import {
   blockedPairKey,
+  buildPersonNameIndex,
   filenameTokens,
   folderTokens,
   groupClusters,
+  matchNamesInTokens,
   parseEmbedding,
   tokenAssociationScore,
 } from "@/helpers/faceLabel.helper";
-import { assetFaces, assets, person } from "@/schema";
-import {
-  and,
-  count,
-  desc,
-  eq,
-  gte,
-  inArray,
-  isNull,
-  notInArray,
-  sql,
-} from "drizzle-orm";
+import { person } from "@/schema";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import type { NextApiRequest, NextApiResponse } from "next";
 
 /** Faces pulled per cluster: the first few are shown, all of them feed tokens. */
@@ -58,6 +50,12 @@ const MAX_ALBUM_SIZE_FOR_SOCIAL = 2000;
  * which then fails the uuid cast.
  */
 const uuidArray = (ids: string[]) => sql`string_to_array(${ids.join(",")}, ',')::uuid[]`;
+
+/**
+ * Wrap a search term for ILIKE. The wildcards a user types are escaped so a
+ * filename containing a literal `%` or `_` is still findable.
+ */
+const likePattern = (term: string) => `%${term.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
 
 type QueueScope = "both" | "clusters" | "unassigned";
 
@@ -106,7 +104,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }
 
     const ownerId = currentUser.id;
-    const batchSize = Math.min(100, toNumber(req.query.batchSize, DEFAULT_BATCH_SIZE));
+    const pageSize = Math.max(
+      1,
+      Math.min(MAX_PAGE_SIZE, toNumber(req.query.pageSize, DEFAULT_PAGE_SIZE))
+    );
     const minFaceCount = toNumber(req.query.minFaceCount, DEFAULT_MIN_FACE_COUNT);
     const similarityThreshold = toNumber(
       req.query.similarityThreshold,
@@ -115,6 +116,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const groupThreshold = toNumber(req.query.groupThreshold, DEFAULT_GROUP_THRESHOLD);
     const page = Math.max(1, toNumber(req.query.page, 1));
     const scope = ((req.query.scope as string) || "both") as QueueScope;
+    const search = ((req.query.search as string) || "").trim();
+    const pattern = search ? likePattern(search) : null;
 
     // ---------------------------------------------------------------- skips
     const skipRows = await appDb
@@ -124,53 +127,111 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const skipClusterIds = skipRows.filter((r) => r.kind === "cluster").map((r) => r.targetId);
     const skipFaceIds = skipRows.filter((r) => r.kind === "face").map((r) => r.targetId);
 
+    // Reusable predicate fragments, so the count and the page query cannot drift.
+    const clusterSkipClause = skipClusterIds.length
+      ? sql`AND NOT (p.id = ANY(${uuidArray(skipClusterIds)}))`
+      : sql``;
+    const clusterSearchClause = pattern
+      ? sql`AND EXISTS (
+          SELECT 1
+          FROM asset_face afs
+          JOIN asset asrch ON asrch.id = afs."assetId"
+          WHERE afs."personId" = p.id
+            AND afs."deletedAt" IS NULL
+            AND afs."isVisible" IS TRUE
+            AND (asrch."originalFileName" ILIKE ${pattern}
+              OR asrch."originalPath" ILIKE ${pattern})
+        )`
+      : sql``;
+    const clusterEligible = sql`
+      SELECT p.id AS id, count(af.id)::int AS face_count
+      FROM person p
+      JOIN asset_face af
+        ON af."personId" = p.id
+       AND af."deletedAt" IS NULL
+       AND af."isVisible" IS TRUE
+      JOIN asset a
+        ON a.id = af."assetId"
+       AND a."deletedAt" IS NULL
+       AND a.status = 'active'
+      WHERE p."ownerId" = ${ownerId}
+        AND p.name = ''
+        AND p."isHidden" IS FALSE
+        ${clusterSkipClause}
+        ${clusterSearchClause}
+      GROUP BY p.id
+      HAVING count(af.id) >= ${minFaceCount}
+    `;
+
+    const faceSkipClause = skipFaceIds.length
+      ? sql`AND NOT (af.id = ANY(${uuidArray(skipFaceIds)}))`
+      : sql``;
+    const faceSearchClause = pattern
+      ? sql`AND (a."originalFileName" ILIKE ${pattern} OR a."originalPath" ILIKE ${pattern})`
+      : sql``;
+    const faceWhere = sql`
+      FROM asset_face af
+      JOIN asset a
+        ON a.id = af."assetId"
+       AND a."deletedAt" IS NULL
+       AND a.status = 'active'
+       AND a."ownerId" = ${ownerId}
+      JOIN face_search fs ON fs."faceId" = af.id
+      WHERE af."personId" IS NULL
+        AND af."deletedAt" IS NULL
+        AND af."isVisible" IS TRUE
+        ${faceSkipClause}
+        ${faceSearchClause}
+    `;
+
+    // ------------------------------------------------------- totals & paging
+    // Real totals, so the page count is honest rather than "there might be more".
+    const wantsClusters = scope !== "unassigned";
+    const wantsFaces = scope !== "clusters";
+
+    const countRows = async (query: ReturnType<typeof sql>) => {
+      const { rows } = await db.execute(query);
+      return Number((rows[0] as any)?.total ?? 0);
+    };
+
+    const totalClusters = wantsClusters
+      ? await countRows(
+          sql`SELECT count(*)::int AS total FROM (${clusterEligible}) eligible`
+        )
+      : 0;
+    const totalFaces = wantsFaces
+      ? await countRows(sql`SELECT count(*)::int AS total ${faceWhere}`)
+      : 0;
+
+    const total = totalClusters + totalFaces;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const offset = (page - 1) * pageSize;
+
+    // Clusters and unassigned faces are paged as one continuous list, clusters
+    // first — so a page never silently drops the tail of either source.
+    const clusterOffset = Math.min(offset, totalClusters);
+    const clusterLimit = Math.max(0, Math.min(pageSize, totalClusters - clusterOffset));
+    const faceOffset = Math.max(0, offset - totalClusters);
+    const faceLimit = Math.max(0, pageSize - clusterLimit);
+
     const units: Unit[] = [];
-    let clusterWindow = 0;
-    let unassignedWindow = 0;
 
     // =================================================== A. unnamed clusters
-    if (scope !== "unassigned") {
-      const clusters = await db
-        .select({
-          id: person.id,
-          faceCount: count(assetFaces.id),
-        })
-        .from(person)
-        .innerJoin(
-          assetFaces,
-          and(
-            eq(assetFaces.personId, person.id),
-            isNull(assetFaces.deletedAt),
-            eq(assetFaces.isVisible, true)
-          )
-        )
-        .innerJoin(
-          assets,
-          and(
-            eq(assets.id, assetFaces.assetId),
-            isNull(assets.deletedAt),
-            eq(assets.status, "active")
-          )
-        )
-        .where(
-          and(
-            eq(person.ownerId, ownerId),
-            eq(person.name, ""),
-            eq(person.isHidden, false),
-            skipClusterIds.length ? notInArray(person.id, skipClusterIds) : undefined
-          )
-        )
-        .groupBy(person.id)
-        .having(gte(count(assetFaces.id), minFaceCount))
-        .orderBy(desc(count(assetFaces.id)), person.id)
-        .limit(CLUSTER_WINDOW_SIZE)
-        .offset((page - 1) * CLUSTER_WINDOW_SIZE);
-
-      clusterWindow = clusters.length;
+    if (wantsClusters && clusterLimit > 0) {
+      const { rows: clusterRows } = await db.execute(sql`
+        SELECT id, face_count
+        FROM (${clusterEligible}) eligible
+        ORDER BY face_count DESC, id
+        LIMIT ${clusterLimit} OFFSET ${clusterOffset}
+      `);
+      const clusters = (clusterRows as any[]).map((row) => ({
+        id: row.id as string,
+        faceCount: Number(row.face_count),
+      }));
 
       if (clusters.length > 0) {
         const clusterIds = clusters.map((c) => c.id);
-        const faceCountById = new Map(clusters.map((c) => [c.id, Number(c.faceCount)]));
+        const faceCountById = new Map(clusters.map((c) => [c.id, c.faceCount]));
 
         const { rows: repRows } = await db.execute(sql`
           SELECT DISTINCT ON (af."personId")
@@ -240,7 +301,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     // ================================================ B. unassigned faces
     // These never became a person, so there is nothing for Immich's people UI
     // to show and nothing to rename — each one has to be attached to a person.
-    if (scope !== "clusters" && units.length < batchSize) {
+    if (wantsFaces && faceLimit > 0) {
       const { rows: faceRows } = await db.execute(sql`
         SELECT af.id AS face_id,
                NULL::uuid AS person_id,
@@ -254,30 +315,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
                a."originalFileName" AS original_file_name,
                a."originalPath" AS original_path,
                fs.embedding AS embedding
-        FROM asset_face af
-        JOIN asset a
-          ON a.id = af."assetId"
-         AND a."deletedAt" IS NULL
-         AND a.status = 'active'
-         AND a."ownerId" = ${ownerId}
-        JOIN face_search fs ON fs."faceId" = af.id
-        WHERE af."personId" IS NULL
-          AND af."deletedAt" IS NULL
-          AND af."isVisible" IS TRUE
-          ${
-            skipFaceIds.length
-              ? sql`AND NOT (af.id = ANY(${uuidArray(skipFaceIds)}))`
-              : sql``
-          }
+        ${faceWhere}
         -- Biggest faces first: more pixels means a better embedding and a
         -- crop the user can actually recognise.
         ORDER BY ((af."boundingBoxX2" - af."boundingBoxX1")
                 * (af."boundingBoxY2" - af."boundingBoxY1")) DESC, af.id
-        LIMIT ${CLUSTER_WINDOW_SIZE}
-        OFFSET ${(page - 1) * CLUSTER_WINDOW_SIZE}
+        LIMIT ${faceLimit} OFFSET ${faceOffset}
       `);
-
-      unassignedWindow = faceRows.length;
 
       if (faceRows.length > 0) {
         const rows = faceRows as any[];
@@ -332,16 +376,21 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
     }
 
+    const emptyResponse = {
+      groups: [],
+      page,
+      pageSize,
+      total,
+      totalPages,
+      counts: { clusters: totalClusters, unassigned: totalFaces },
+    };
     if (units.length === 0) {
-      return res.status(200).json({
-        groups: [],
-        hasMore: false,
-        windowSize: 0,
-        counts: { clusters: clusterWindow, unassigned: unassignedWindow },
-      });
+      return res.status(200).json(emptyResponse);
     }
 
-    const visible = units.slice(0, batchSize);
+    // Every unit fetched for this page is shown — the page size is the paging
+    // unit, so there is nothing left over to hide.
+    const visible = units;
 
     // ------------------------------- sample faces for the cluster units
     const visibleClusterIds = visible.flatMap((u) => u.clusterIds);
@@ -576,6 +625,23 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
     }
 
+    // --------------------------- 5. names Immich already knows, matched
+    // against the same tokens. The learned index only speaks about filenames
+    // that already sit beside a labelled face, so it says nothing about a
+    // person whose photos are all unlabelled — this covers that gap.
+    const namedPeople = await db
+      .select({ id: person.id, name: person.name })
+      .from(person)
+      .where(
+        and(
+          eq(person.ownerId, ownerId),
+          eq(person.isHidden, false),
+          sql`${person.name} <> ''`
+        )
+      );
+    const nameIndex = buildPersonNameIndex(namedPeople);
+    for (const row of namedPeople) nameById.set(row.id, row.name);
+
     // Names for people that only the token index knows about.
     const tokenPersonIds = Array.from(
       new Set(
@@ -595,13 +661,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
     }
 
-    // -------------------------------------------- 5. combine per unit
+    // -------------------------------------------- 6. combine per unit
     const groups = visible.map((unit) => {
       const candidates = new Map<
         string,
         {
           personId: string;
           faceScore: number;
+          nameScore: number;
           filenameScore: number;
           socialScore: number;
           sharedAssets: number;
@@ -615,6 +682,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           candidate = {
             personId,
             faceScore: 0,
+            nameScore: 0,
             filenameScore: 0,
             socialScore: 0,
             sharedAssets: 0,
@@ -656,6 +724,24 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
               }
             }
           }
+
+          const matches = matchNamesInTokens(
+            Array.from(perSource.get(source) ?? []),
+            nameIndex
+          );
+          for (const [personId, match] of Array.from(matches.entries())) {
+            const candidate = ensure(personId);
+            if (match.score <= candidate.nameScore) continue;
+            candidate.nameScore = match.score;
+            candidate.evidence = candidate.evidence.filter(
+              (e) => !e.startsWith("Named in the")
+            );
+            candidate.evidence.push(
+              `Named in the ${source} — "${match.token}"${
+                match.exact ? "" : " looks like their name"
+              }`
+            );
+          }
         }
       }
 
@@ -681,6 +767,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         .map((candidate) => {
           const confidence =
             SIGNAL_WEIGHTS.face * candidate.faceScore +
+            SIGNAL_WEIGHTS.name * candidate.nameScore +
             SIGNAL_WEIGHTS.filename * candidate.filenameScore +
             SIGNAL_WEIGHTS.social * candidate.socialScore -
             (candidate.sharedAssets > 0 ? SAME_ASSET_PENALTY : 0);
@@ -697,6 +784,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             confidence: Math.max(0, Math.min(1, confidence)),
             signals: {
               face: candidate.faceScore,
+              name: candidate.nameScore,
               filename: candidate.filenameScore,
               social: candidate.socialScore,
               sharedAssets: candidate.sharedAssets,
@@ -717,6 +805,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         sampleFaces: unit.faces.slice(0, SAMPLE_ASSETS_PER_GROUP).map((face) => ({
           faceId: face.face_id,
           assetId: face.asset_id,
+          fileName: face.original_file_name,
           imageWidth: Number(face.image_width),
           imageHeight: Number(face.image_height),
           boundingBox: {
@@ -732,12 +821,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     return res.status(200).json({
       groups,
-      windowSize: clusterWindow + unassignedWindow,
-      hasMore:
-        units.length > batchSize ||
-        clusterWindow === CLUSTER_WINDOW_SIZE ||
-        unassignedWindow === CLUSTER_WINDOW_SIZE,
-      counts: { clusters: clusterWindow, unassigned: unassignedWindow },
+      page,
+      pageSize,
+      total,
+      totalPages,
+      counts: { clusters: totalClusters, unassigned: totalFaces },
     });
   } catch (error: any) {
     return res

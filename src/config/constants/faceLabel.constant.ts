@@ -15,15 +15,22 @@ export const DEFAULT_GROUP_THRESHOLD = 0.75;
 /** Clusters with fewer faces than this are skipped by default (noise). */
 export const DEFAULT_MIN_FACE_COUNT = 2;
 
-/** Groups shown per review batch. */
-export const DEFAULT_BATCH_SIZE = 24;
+/**
+ * Clusters and unassigned faces scanned per page.
+ *
+ * This is the paging unit, not the card count: a page fetches this many rows,
+ * groups them, and shows every group that comes out — so the number of cards
+ * is this or fewer, and nothing in the page is discarded.
+ */
+export const DEFAULT_PAGE_SIZE = 60;
 
 /**
- * How many unnamed clusters are pulled in one pass for grouping. Pairwise
- * comparison is O(n^2 * 512); 300 keeps that in the low milliseconds. Raising
- * it materially is the fastest way to make this page feel slow.
+ * Ceiling on the page size. Grouping compares every pair in the page and each
+ * comparison is over a 512-dimension vector, so this is O(n^2 * 512); 300 keeps
+ * that in the low milliseconds. Raising it is the fastest way to make this page
+ * feel slow.
  */
-export const CLUSTER_WINDOW_SIZE = 300;
+export const MAX_PAGE_SIZE = 300;
 
 /** Sample faces per cluster used to query for similar named people. */
 export const SAMPLE_FACES_PER_CLUSTER = 3;
@@ -38,12 +45,37 @@ export const KNN_OVERFETCH = 200;
 /** Sample assets shown per group in the UI. */
 export const SAMPLE_ASSETS_PER_GROUP = 6;
 
+/**
+ * Faces loaded per page in the review dialog. Each one renders a cropped
+ * preview image, so this is a bandwidth limit as much as a query limit.
+ */
+export const GROUP_FACES_PAGE_SIZE = 120;
+
 /** Signal weights. Face similarity dominates; the rest adjust the ordering. */
 export const SIGNAL_WEIGHTS = {
   face: 1,
+  /** A person's name appearing literally in the filename or folder. */
+  name: 0.55,
   filename: 0.45,
   social: 0.15,
 };
+
+/**
+ * Strength of a filename token matching a known person's name.
+ *
+ * Weaker than a learned token association of the same size would be — a folder
+ * called "morgan family" is not proof — but it is the only signal available for
+ * a person whose photos are all still unlabelled.
+ */
+export const NAME_MATCH_SCORES = {
+  /** Every part of the name present, e.g. both "taylor" and "morgan". */
+  fullName: 1,
+  exact: 0.85,
+  prefix: 0.5,
+};
+
+/** Shortest prefix of a filename token that may stand in for a name. */
+export const NAME_MATCH_MIN_PREFIX = 4;
 
 /**
  * Penalty applied when a candidate already has a face in the *same* asset.
@@ -109,9 +141,18 @@ export const TOKEN_STOP_WORDS = new Set([
   "google", "photos", "takeout", "backup", "backups", "upload", "uploads",
   "download", "downloads", "media", "files", "album", "albums", "folder",
   "year", "years", "month", "day", "date", "and", "the", "with", "from",
+  // Social exports: "taylorrr__export_20240115103000.jpg" and friends.
+  "feed", "story", "stories", "reel", "reels", "post", "posts", "profile",
+  "avatar", "timeline", "highlight", "highlights", "saved", "tagged",
 ]);
 
 /** Tokens that are pure numbers, dates, times or resolutions carry no identity. */
 export const TOKEN_NUMERIC_PATTERN = /^\d+$/;
 export const TOKEN_DATELIKE_PATTERN = /^(19|20)\d{2}([-_]?\d{2}){0,2}$/;
 export const TOKEN_RESOLUTION_PATTERN = /^\d+x\d+$/;
+
+/**
+ * Content hashes and uuid fragments. Only rejected when they also contain a
+ * digit, so ordinary words that happen to be hex ("added", "faced") survive.
+ */
+export const TOKEN_HEXLIKE_PATTERN = /^[0-9a-f]{8,}$/;

@@ -6,7 +6,7 @@ import { faceLabelSkips } from "@/db/schema";
 import { getCurrentUser } from "@/handlers/serverUtils/user.utils";
 import { getUserHeaders } from "@/helpers/user.helper";
 import { assetFaces, person } from "@/schema";
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { and, count, eq, inArray, isNull } from "drizzle-orm";
 import type { NextApiRequest, NextApiResponse } from "next";
 
 type ApplyAction = "name" | "merge" | "hide" | "skip";
@@ -16,6 +16,8 @@ interface ApplyItem {
   clusterIds?: string[];
   /** Unassigned faces (kind "faces") — no person row exists yet. */
   faceIds?: string[];
+  /** Faces the user unticked in the review dialog. */
+  excludedFaceIds?: string[];
   action: ApplyAction;
   name?: string;
   targetPersonId?: string;
@@ -113,6 +115,44 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return Boolean(row && row.ownerId === ownerId && row.name === "");
     };
 
+    // ------------------------------------------------- excluded faces
+    // A face the user unticked is only honoured if it really is in the group
+    // it was unticked from — a stale page must not be able to reassign
+    // arbitrary faces.
+    const allExcludedIds = Array.from(
+      new Set(items.flatMap((item) => item.excludedFaceIds ?? []))
+    );
+    const excludedOwner = new Map<string, string | null>();
+    if (allExcludedIds.length > 0) {
+      const rows = await db
+        .select({ id: assetFaces.id, personId: assetFaces.personId })
+        .from(assetFaces)
+        .where(
+          and(inArray(assetFaces.id, allExcludedIds), isNull(assetFaces.deletedAt))
+        );
+      for (const row of rows) excludedOwner.set(row.id, row.personId);
+    }
+
+    // Live face counts, so a group with everything unticked fails loudly
+    // rather than naming an empty cluster.
+    const clusterFaceCounts = new Map<string, number>();
+    if (allClusterIds.length > 0) {
+      const rows = await db
+        .select({ personId: assetFaces.personId, total: count(assetFaces.id) })
+        .from(assetFaces)
+        .where(
+          and(
+            inArray(assetFaces.personId, allClusterIds),
+            isNull(assetFaces.deletedAt),
+            eq(assetFaces.isVisible, true)
+          )
+        )
+        .groupBy(assetFaces.personId);
+      for (const row of rows) {
+        if (row.personId) clusterFaceCounts.set(row.personId, Number(row.total));
+      }
+    }
+
     const renameUpdates: { id: string; name: string }[] = [];
     const hideUpdates: { id: string; isHidden: boolean }[] = [];
     const mergeOps: { target: string; ids: string[]; itemIndex: number }[] = [];
@@ -125,10 +165,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }[] = [];
     const skips: { kind: string; targetId: string }[] = [];
     const itemIndexByPersonId = new Map<string, number>();
+    // Faces to lift out of their cluster before it is named or merged.
+    const splitOps: { itemIndex: number; faceIds: string[] }[] = [];
 
     items.forEach((item, index) => {
       const clusterIds = (item.clusterIds ?? []).filter(eligibleCluster);
-      const faceIds = (item.faceIds ?? []).filter((id) => liveFaceIds.has(id));
+      const excluded = new Set(item.excludedFaceIds ?? []);
+      const faceIds = (item.faceIds ?? []).filter(
+        (id) => liveFaceIds.has(id) && !excluded.has(id)
+      );
       const isFaceItem = (item.faceIds ?? []).length > 0;
 
       const base = { clusterIds, faceIds, action: item.action };
@@ -164,6 +209,32 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           itemIndexByPersonId.set(id, index);
         }
         return;
+      }
+
+      // From here the group is being attributed to somebody, so any face the
+      // user unticked has to leave the cluster first — a merge takes every
+      // face the cluster holds and cannot be undone.
+      if (clusterIds.length > 0 && excluded.size > 0) {
+        const toSplit = Array.from(excluded).filter((id) => {
+          const personId = excludedOwner.get(id);
+          return Boolean(personId && clusterIds.includes(personId));
+        });
+
+        if (toSplit.length > 0) {
+          const totalFaces = clusterIds.reduce(
+            (sum, id) => sum + (clusterFaceCounts.get(id) ?? 0),
+            0
+          );
+          if (totalFaces - toSplit.length <= 0) {
+            results[index] = {
+              ...base,
+              status: "failed",
+              error: "Every face in this group was excluded — nothing left to label",
+            };
+            return;
+          }
+          splitOps.push({ itemIndex: index, faceIds: toSplit });
+        }
       }
 
       if (item.action === "merge") {
@@ -203,11 +274,80 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
     });
 
+    // ------------------------------------------------------------- phase 0.5
+    // Lift unticked faces out of their cluster, into a fresh unnamed person.
+    //
+    // This has to happen before the rename, or the faces the user rejected get
+    // the name too. Immich has no "unassign a face" call — reassigning is the
+    // only move — so the leftovers land in a new unnamed cluster, which is
+    // exactly where the labelling queue picks them up again.
+    for (const op of splitOps) {
+      if (results[op.itemIndex]?.status === "failed") continue;
+
+      // An empty body creates a person with no name; naming it would hide it
+      // from the queue, which is the opposite of what we want.
+      planned.push({ method: "POST", path: "/api/people", body: {} });
+
+      let leftoverPersonId = "<new-unnamed-person-id>";
+      if (!dryRun) {
+        const created = await immich("/people", "POST", {});
+        if (!created.ok) {
+          results[op.itemIndex] = {
+            ...results[op.itemIndex],
+            status: "failed",
+            error: `Could not set the excluded faces aside (HTTP ${created.status})`,
+          };
+          continue;
+        }
+        leftoverPersonId = ((await created.json()) as { id: string }).id;
+      }
+
+      let failures = 0;
+      for (const faceId of op.faceIds) {
+        planned.push({
+          method: "PUT",
+          path: `/api/faces/${leftoverPersonId}`,
+          body: { id: faceId },
+        });
+        if (dryRun) continue;
+
+        const response = await immich(`/faces/${leftoverPersonId}`, "PUT", {
+          id: faceId,
+        });
+        if (!response.ok) failures += 1;
+      }
+
+      // Naming the group anyway would silently label the faces the user
+      // rejected, so a failed split stops the item.
+      if (failures > 0) {
+        results[op.itemIndex] = {
+          ...results[op.itemIndex],
+          status: "failed",
+          error: `${failures} of ${op.faceIds.length} excluded face(s) could not be moved out, so nothing was applied to this group`,
+        };
+      }
+    }
+
+    const splitFailed = new Set(
+      splitOps
+        .filter((op) => results[op.itemIndex]?.status === "failed")
+        .map((op) => op.itemIndex)
+    );
+
     // ------------------------------------------------------------- phase 1
     // Renames and hides for existing person records: one bulk call.
+    const stillLive = (personId: string) => {
+      const index = itemIndexByPersonId.get(personId);
+      return index === undefined || !splitFailed.has(index);
+    };
+
     const peopleUpdates = [
-      ...renameUpdates.map((u) => ({ id: u.id, name: u.name })),
-      ...hideUpdates.map((u) => ({ id: u.id, isHidden: u.isHidden })),
+      ...renameUpdates
+        .filter((u) => stillLive(u.id))
+        .map((u) => ({ id: u.id, name: u.name })),
+      ...hideUpdates
+        .filter((u) => stillLive(u.id))
+        .map((u) => ({ id: u.id, isHidden: u.isHidden })),
     ];
 
     if (peopleUpdates.length > 0) {

@@ -8,6 +8,8 @@ export interface IFaceBoundingBox {
 export interface IFaceSample {
   faceId: string;
   assetId: string;
+  /** Original filename, shown so a filename-driven suggestion is checkable. */
+  fileName?: string;
   /** Dimensions the detector ran on — the bounding box is in these coordinates. */
   imageWidth: number;
   imageHeight: number;
@@ -16,6 +18,8 @@ export interface IFaceSample {
 
 export interface IFaceLabelSignals {
   face: number;
+  /** A known person's name appearing literally in the filename or folder. */
+  name: number;
   filename: number;
   social: number;
   /** Photos where this candidate already appears alongside the cluster. */
@@ -52,8 +56,12 @@ export interface IFaceLabelGroup {
 
 export interface IFaceLabelQueueResponse {
   groups: IFaceLabelGroup[];
-  windowSize: number;
-  hasMore: boolean;
+  page: number;
+  /** Clusters and faces scanned per page — not the number of cards. */
+  pageSize: number;
+  /** Total clusters + unassigned faces matching the current filters. */
+  total: number;
+  totalPages: number;
   counts: { clusters: number; unassigned: number };
 }
 
@@ -61,11 +69,13 @@ export type FaceLabelScope = "both" | "clusters" | "unassigned";
 
 export interface IFaceLabelQueueFilters {
   scope?: FaceLabelScope;
-  batchSize?: number;
+  pageSize?: number;
   minFaceCount?: number;
   similarityThreshold?: number;
   groupThreshold?: number;
   page?: number;
+  /** Substring match against the original filename and path. */
+  search?: string;
 }
 
 export type FaceLabelAction = "name" | "merge" | "hide" | "skip";
@@ -73,9 +83,22 @@ export type FaceLabelAction = "name" | "merge" | "hide" | "skip";
 export interface IFaceLabelApplyItem {
   clusterIds?: string[];
   faceIds?: string[];
+  /**
+   * Faces the user unticked while reviewing the group. They are kept out of
+   * whatever the group is named or merged into.
+   */
+  excludedFaceIds?: string[];
   action: FaceLabelAction;
   name?: string;
   targetPersonId?: string;
+}
+
+/** One page of the faces behind a group, for the review dialog. */
+export interface IFaceLabelGroupFacesResponse {
+  faces: IFaceSample[];
+  total: number;
+  page: number;
+  pageSize: number;
 }
 
 export interface IFaceLabelApplyRequest {

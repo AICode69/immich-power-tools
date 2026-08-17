@@ -1,6 +1,7 @@
 import {
   FACE_LABEL_APPLY_PATH,
   FACE_LABEL_DUPLICATES_PATH,
+  FACE_LABEL_GROUP_FACES_PATH,
   FACE_LABEL_QUEUE_PATH,
   FACE_LABEL_TOKEN_INDEX_PATH,
   MERGE_PERSON_PATH,
@@ -10,6 +11,7 @@ import {
   IDuplicatePersonGroup,
   IFaceLabelApplyRequest,
   IFaceLabelApplyResponse,
+  IFaceLabelGroupFacesResponse,
   IFaceLabelIndexStatus,
   IFaceLabelQueueFilters,
   IFaceLabelQueueResponse,
@@ -19,6 +21,19 @@ export const listFaceLabelQueue = (
   filters: IFaceLabelQueueFilters
 ): Promise<IFaceLabelQueueResponse> => {
   return API.get(FACE_LABEL_QUEUE_PATH, filters);
+};
+
+/** Every face behind one group, paged, for the review dialog. */
+export const listGroupFaces = (params: {
+  clusterIds?: string[];
+  faceIds?: string[];
+  page?: number;
+}): Promise<IFaceLabelGroupFacesResponse> => {
+  return API.get(FACE_LABEL_GROUP_FACES_PATH, {
+    clusterIds: params.clusterIds?.join(",") || undefined,
+    faceIds: params.faceIds?.join(",") || undefined,
+    page: params.page ?? 1,
+  });
 };
 
 export const applyFaceLabels = (

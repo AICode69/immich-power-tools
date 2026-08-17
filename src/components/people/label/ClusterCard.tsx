@@ -6,10 +6,11 @@ import { searchPeople } from "@/handlers/api/people.handler";
 import { cn } from "@/lib/utils";
 import { IFaceLabelGroup, IFaceLabelSuggestion } from "@/types/faceLabel";
 import { IPerson } from "@/types/person";
-import { EyeOff, Images, ScanFace, SkipForward, Users } from "lucide-react";
+import { EyeOff, Images, ListFilter, ScanFace, SkipForward, Users } from "lucide-react";
 import React, { useState } from "react";
 import FaceCrop from "./FaceCrop";
 import FullPhotoPreview from "./FullPhotoPreview";
+import GroupFacesDialog from "./GroupFacesDialog";
 import SuggestionChips from "./SuggestionChips";
 
 export interface IClusterDecision {
@@ -22,6 +23,9 @@ interface IProps {
   group: IFaceLabelGroup;
   decision?: IClusterDecision;
   focused?: boolean;
+  /** Faces unticked in the review dialog, held by the board. */
+  excludedFaceIds?: string[];
+  onExcludedChange: (faceIds: string[]) => void;
   onChange: (decision: IClusterDecision | undefined) => void;
   onFocus: () => void;
 }
@@ -30,14 +34,18 @@ export default function ClusterCard({
   group,
   decision,
   focused,
+  excludedFaceIds = [],
+  onExcludedChange,
   onChange,
   onFocus,
 }: IProps) {
   const [activeFaceIndex, setActiveFaceIndex] = useState(0);
   const [showPhoto, setShowPhoto] = useState(false);
   const [inputValue, setInputValue] = useState("");
+  const [reviewOpen, setReviewOpen] = useState(false);
 
   const activeFace = group.sampleFaces[activeFaceIndex] ?? group.sampleFaces[0];
+  const keptCount = group.faceCount - excludedFaceIds.length;
 
   const handleSuggestion = (suggestion: IFaceLabelSuggestion) => {
     if (
@@ -94,10 +102,24 @@ export default function ClusterCard({
     >
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          <span className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={() => setReviewOpen(true)}
+            title="Review every face in this group and untick anyone who is not this person"
+            className="flex items-center gap-1 rounded px-1 -mx-1 hover:bg-accent hover:text-accent-foreground"
+          >
             <Images className="h-3.5 w-3.5" />
-            {group.faceCount} {group.faceCount === 1 ? "face" : "faces"}
-          </span>
+            {excludedFaceIds.length > 0 ? (
+              <span className="font-medium text-primary">
+                {keptCount} of {group.faceCount} faces
+              </span>
+            ) : (
+              <span>
+                {group.faceCount} {group.faceCount === 1 ? "face" : "faces"}
+              </span>
+            )}
+            <ListFilter className="h-3 w-3 opacity-60" />
+          </button>
           {group.kind === "faces" ? (
             <Badge variant="outline" className="gap-1" title="Immich never grouped these into a person">
               <ScanFace className="h-3 w-3" />
@@ -147,7 +169,7 @@ export default function ClusterCard({
             key={face.faceId}
             face={face}
             selected={index === activeFaceIndex && showPhoto}
-            title="Show the full photo"
+            title={face.fileName || "Show the full photo"}
             onClick={() => {
               setActiveFaceIndex(index);
               setShowPhoto(index !== activeFaceIndex ? true : !showPhoto);
@@ -155,6 +177,17 @@ export default function ClusterCard({
           />
         ))}
       </div>
+
+      {/* The filename is what a filename-based suggestion is built on, so it
+          is worth showing rather than making the user open the photo. */}
+      {activeFace?.fileName && (
+        <p
+          className="truncate font-mono text-[11px] text-muted-foreground"
+          title={activeFace.fileName}
+        >
+          {activeFace.fileName}
+        </p>
+      )}
 
       {showPhoto && activeFace && <FullPhotoPreview face={activeFace} />}
 
@@ -189,8 +222,24 @@ export default function ClusterCard({
       />
 
       {decision && (
-        <p className="text-xs font-medium text-primary">{decisionLabel()}</p>
+        <p className="text-xs font-medium text-primary">
+          {decisionLabel()}
+          {excludedFaceIds.length > 0 && (
+            <span className="font-normal text-muted-foreground">
+              {" "}
+              · {excludedFaceIds.length} face(s) left out
+            </span>
+          )}
+        </p>
       )}
+
+      <GroupFacesDialog
+        group={group}
+        open={reviewOpen}
+        onOpenChange={setReviewOpen}
+        excludedFaceIds={excludedFaceIds}
+        onChange={onExcludedChange}
+      />
     </div>
   );
 }
