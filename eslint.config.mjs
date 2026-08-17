@@ -1,5 +1,4 @@
 import { defineConfig } from "eslint/config";
-import nextCoreWebVitals from "eslint-config-next/core-web-vitals";
 import remotion from "@remotion/eslint-plugin";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,11 +14,10 @@ const compat = new FlatCompat({
 });
 
 export default defineConfig([{
-    extends: [...nextCoreWebVitals],
-
-    plugins: {
-        "@remotion": remotion,
-    },
+    // Build output and dependencies are not ours to lint.
+    ignores: [".next/**", "out/**", "build/**", "node_modules/**"],
+}, {
+    extends: [...compat.extends("next/core-web-vitals")],
 
     rules: {
         "react-hooks/exhaustive-deps": "off",
@@ -27,5 +25,10 @@ export default defineConfig([{
     },
 }, {
     files: ["remotion/*.{ts,tsx}"],
-    extends: [...compat.extends("plugin:@remotion/recommended")],
+    plugins: {
+        "@remotion": remotion,
+    },
+    rules: {
+        ...remotion.configs.recommended.rules,
+    },
 }]);
