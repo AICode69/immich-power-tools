@@ -50,6 +50,13 @@
       "when": 1786663388741,
       "tag": "0006_curious_shaman",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1786797891240,
+      "tag": "0007_tired_firebrand",
+      "breakpoints": true
     }
   ]
 }

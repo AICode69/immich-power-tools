@@ -26,6 +26,15 @@ export const WORKFLOW_PERMISSIONS: Permission[] = [
   { name: "tag.asset", description: "Assign tags to assets" },
 ];
 
+/**
+ * Immich's job endpoints are admin-only, so this key must belong to an admin
+ * user — a non-admin key with these permissions still gets a 403.
+ */
+export const JOB_PERMISSIONS: Permission[] = [
+  { name: "job.read", description: "Read job queue status and counts" },
+  { name: "job.create", description: "Start, pause and clear job queues" },
+];
+
 export const FACE_LABEL_PERMISSIONS: Permission[] = [
   { name: "person.read", description: "Read people and face clusters" },
   { name: "person.update", description: "Name people and hide junk clusters" },
