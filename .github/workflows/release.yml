@@ -2,24 +2,28 @@ name: Release
 
 # main is treated as always releasable: every push to it builds and publishes.
 #
-# A hand-pushed tag still works and wins — push `v0.23.0` and that exact version
-# is released instead of the next auto-bumped one. That is how you move the
-# sequence onto a new base version after merging upstream.
+# To cut a specific version instead of the next auto-bumped one — moving the
+# sequence onto a new base after merging upstream, say — run this workflow
+# manually and give it a version. That is deliberately a workflow_dispatch
+# input rather than a tag trigger: combining `branches` and `tags` filters in
+# one push event does NOT reliably fire for branch pushes, which was verified
+# here the hard way by a push to main that triggered nothing at all.
 #
 # No recursion risk: the tag this workflow creates is made with GITHUB_TOKEN,
 # and GitHub deliberately does not start new workflow runs from those events.
 #
 # To land a commit on main without cutting a release, put [skip ci] in the
-# commit message. That is preferred over a paths-ignore filter here, because
-# path filters and tag filters interact in ways that are easy to get wrong and
-# would silently stop a hand-cut version from releasing.
+# commit message.
 on:
   push:
     branches:
       - main
-    tags:
-      - "v*.*.*"
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact version to release, e.g. v0.23.0. Blank = auto-bump."
+        required: false
+        default: ""
 
 jobs:
   version:
@@ -35,12 +39,16 @@ jobs:
 
       - name: Decide the version for this release
         id: compute
+        # Via env, not ${{ }} inline: a dispatch input is user-controlled text
+        # and must never be interpolated straight into the shell.
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
 
-          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-            # Somebody cut a specific version by hand — honour it exactly.
-            tag="$GITHUB_REF_NAME"
+          if [ -n "${REQUESTED_VERSION:-}" ]; then
+            # Somebody asked for a specific version — honour it exactly.
+            tag="$REQUESTED_VERSION"
           else
             # Continue this fork's own -pft.N sequence. package.json is NOT the
             # source of truth: it trails the upstream tags (0.19.1 while the
