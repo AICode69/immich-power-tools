@@ -1,12 +1,66 @@
 name: Release
 
+# main is treated as always releasable: every push to it builds and publishes.
+#
+# A hand-pushed tag still works and wins — push `v0.23.0` and that exact version
+# is released instead of the next auto-bumped one. That is how you move the
+# sequence onto a new base version after merging upstream.
+#
+# No recursion risk: the tag this workflow creates is made with GITHUB_TOKEN,
+# and GitHub deliberately does not start new workflow runs from those events.
+#
+# To land a commit on main without cutting a release, put [skip ci] in the
+# commit message. That is preferred over a paths-ignore filter here, because
+# path filters and tag filters interact in ways that are easy to get wrong and
+# would silently stop a hand-cut version from releasing.
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*.*.*"
+  workflow_dispatch:
 
 jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.compute.outputs.tag }}
+      version: ${{ steps.compute.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Tags are the version source, so shallow history is not enough.
+          fetch-depth: 0
+
+      - name: Decide the version for this release
+        id: compute
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            # Somebody cut a specific version by hand — honour it exactly.
+            tag="$GITHUB_REF_NAME"
+          else
+            # Continue this fork's own -pft.N sequence. package.json is NOT the
+            # source of truth: it trails the upstream tags (0.19.1 while the
+            # tags were already at v0.22.x), so using it would move backwards.
+            latest=$(git tag -l 'v*-pft.*' | sort -V | tail -n1)
+            if [ -n "$latest" ]; then
+              tag="${latest%-pft.*}-pft.$(( ${latest##*-pft.} + 1 ))"
+            else
+              # No fork tags yet: start a sequence on the newest plain version.
+              base=$(git tag -l 'v*.*.*' | grep -v -- '-' | sort -V | tail -n1)
+              tag="${base:-v0.0.0}-pft.1"
+            fi
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag" >> "$GITHUB_STEP_SUMMARY"
+
   build:
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -33,10 +87,6 @@ jobs:
 
       - uses: actions/checkout@v6
 
-      - name: Extract version from tag
-        id: version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
-
       - uses: docker/metadata-action@v5
         id: meta
         with:
@@ -61,7 +111,7 @@ jobs:
           cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
           cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
           build-args: |
-            VERSION=${{ steps.version.outputs.VERSION }}
+            VERSION=${{ needs.version.outputs.version }}
 
       - name: Export digest
         run: |
@@ -78,7 +128,7 @@ jobs:
 
   merge:
     runs-on: ubuntu-24.04
-    needs: build
+    needs: [version, build]
     permissions:
       contents: write
       packages: write
@@ -101,14 +151,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Raw tags rather than type=semver: the version is computed above and is
+      # not in the git ref on a branch push, so there is nothing to parse.
       - uses: docker/metadata-action@v5
         id: meta
         with:
           images: ${{ env.IMAGE }}
           tags: |
             type=raw,value=latest
-            type=semver,pattern={{major}}.{{minor}}.{{patch}}
-            type=raw,value=${{ github.ref_name }}
+            type=raw,value=${{ needs.version.outputs.tag }}
+            type=raw,value=${{ needs.version.outputs.version }}
 
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
@@ -118,11 +170,14 @@ jobs:
 
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
+          docker buildx imagetools inspect ${{ env.IMAGE }}:${{ needs.version.outputs.tag }}
 
+      # Creates the tag as well — on a branch push there is no tag yet.
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
