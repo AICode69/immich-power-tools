@@ -132,15 +132,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # One open conflict issue at a time -- a weekly schedule would
-          # otherwise file the same report until somebody does the merge.
-          if [ -n "$(gh issue list --label upstream-sync --state open --json number --jq '.[].number')" ]; then
-            echo "Conflict issue already open; leaving it alone." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
-          gh label create upstream-sync --color 0E8A16 --description "Upstream sync automation" 2>/dev/null || true
-
           {
             echo "\`upstream/main\` no longer merges cleanly, so this needs a human."
             echo
@@ -164,9 +155,26 @@ jobs:
             echo '```'
             echo "${{ steps.merge.outputs.range }}"
             echo '```'
-          } > /tmp/issue.md
+          } > /tmp/report.md
 
-          gh issue create \
-            --title "Upstream sync needs manual merge (${{ steps.check.outputs.behind }} commit(s) behind)" \
-            --label upstream-sync \
-            --body-file /tmp/issue.md
+          # The report always lands in the run summary, which needs no repo
+          # feature turned on. Issues are only a nicety on top: this fork has
+          # them disabled, and gh would hard-fail here if we depended on them.
+          cat /tmp/report.md >> "$GITHUB_STEP_SUMMARY"
+
+          if gh issue list --label upstream-sync --state open --json number --jq '.[].number' > /tmp/open.txt 2>/dev/null; then
+            if [ -s /tmp/open.txt ]; then
+              echo "Conflict issue already open; leaving it alone."
+            else
+              gh label create upstream-sync --color 0E8A16 --description "Upstream sync automation" 2>/dev/null || true
+              gh issue create                 --title "Upstream sync needs manual merge (${{ steps.check.outputs.behind }} commit(s) behind)"                 --label upstream-sync                 --body-file /tmp/report.md || echo "Could not open an issue; the summary above is the report."
+            fi
+          else
+            echo "Issues are disabled on this repo -- reporting via the run summary only."
+          fi
+
+          # Fail the run on purpose. A red run is what actually notifies the
+          # owner; a green one that quietly did nothing would let the fork
+          # drift for weeks unnoticed.
+          echo "::error::upstream/main does not merge cleanly -- see the run summary."
+          exit 1
