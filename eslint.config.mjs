@@ -15,7 +15,7 @@ const compat = new FlatCompat({
 
 export default defineConfig([{
     // Build output and dependencies are not ours to lint.
-    ignores: [".next/**", "out/**", "build/**", "node_modules/**"],
+    ignores: [".next/**", "out/**", "build/**", "node_modules/**", "public/**"],
 }, {
     extends: [...compat.extends("next/core-web-vitals")],
 

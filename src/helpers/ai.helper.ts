@@ -5,7 +5,7 @@ import { z } from "zod";
 import { removeNullOrUndefinedProperties } from "./data.helper";
 
 interface FindQuery {
-  query: string;
+  query?: string;
   personIds?: string[];
   city?: string;
   country?: string;
@@ -19,9 +19,20 @@ interface FindQuery {
 
 const allowedTypes = ["IMAGE", "VIDEO", "AUDIO"];
 
+// Immich's search API validates takenAfter/takenBefore as full ISO 8601
+// datetimes and rejects a bare YYYY-MM-DD value with
+// `invalid_format` / `format: "datetime"`, so date-only values must be expanded
+// before they reach the API.
+const isDateOnly = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value);
+
 
 const responseSchema = z.object({
-  query: z.string().describe("Gist of the query. Remove the details of tags"),
+  query: z
+    .string()
+    .nullish()
+    .describe(
+      "Gist of the query. Remove the details of tags. Omit when the query is only filters (dates, people, places, media type)"
+    ),
   personIds: z
     .array(z.string())
     .nullish()
@@ -87,6 +98,8 @@ export const parseFindQuery = async (query: string): Promise<FindQuery> => {
     }),
   });
 
+  console.log(`[ai] parseFindQuery raw response for "${query}":`, text);
+
   const parsedResponse = JSON.parse(text) as FindQuery;
 
   if (parsedResponse.type) {
@@ -107,5 +120,19 @@ export const parseFindQuery = async (query: string): Promise<FindQuery> => {
     delete parsedResponse.takenBefore;
   }
 
-  return removeNullOrUndefinedProperties(parsedResponse) as any as FindQuery;
+  // Expand date-only values into the datetimes Immich expects. This must run
+  // after the guardrail above, which compares plain YYYY-MM-DD strings.
+  // takenBefore uses the end of the day so that a single-day range (e.g.
+  // "videos yesterday", where both bounds are the same date) still covers the
+  // whole day instead of being an empty interval.
+  if (parsedResponse.takenAfter && isDateOnly(parsedResponse.takenAfter)) {
+    parsedResponse.takenAfter = `${parsedResponse.takenAfter}T00:00:00.000Z`;
+  }
+  if (parsedResponse.takenBefore && isDateOnly(parsedResponse.takenBefore)) {
+    parsedResponse.takenBefore = `${parsedResponse.takenBefore}T23:59:59.999Z`;
+  }
+
+  const filters = removeNullOrUndefinedProperties(parsedResponse) as any as FindQuery;
+  console.log("[ai] parseFindQuery filters:", filters);
+  return filters;
 };
