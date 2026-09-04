@@ -1,0 +1,172 @@
+name: Upstream Sync
+
+# Keeps this fork current with immich-power-tools/immich-power-tools.
+#
+# The merge is attempted here, but nothing lands on main by itself: a clean
+# result becomes a pull request, and a conflicted one becomes an issue naming
+# the files that need a human. That split is deliberate. Our fork carries real
+# divergence (Power Face Label, job scheduling, the release pipeline), so the
+# conflicts that do occur are judgement calls -- the eslint.config.mjs clash in
+# the v0.23.0 sync had to keep our flat-config @remotion loading over
+# upstream's compat.extends, which no merge driver could have picked.
+#
+# Merging the PR is a push to main, which is what cuts the release. Review the
+# diff, then merge when you want that release.
+
+on:
+  schedule:
+    # Mondays, 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+# One sync at a time; a slow run must not race the next schedule onto the
+# same branch.
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/immich-power-tools/immich-power-tools.git
+  SYNC_BRANCH: sync/upstream
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Full history: a merge needs the real merge base, and the tag list
+          # is what the release workflow versions from.
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM" 2>/dev/null || git remote set-url upstream "$UPSTREAM"
+          git fetch upstream main --tags
+
+      - name: Check for new upstream commits
+        id: check
+        run: |
+          set -euo pipefail
+          behind=$(git rev-list --count HEAD..upstream/main)
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          if [ "$behind" -eq 0 ]; then
+            echo "Already up to date with upstream." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "$behind new upstream commit(s)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Attempt the merge
+        id: merge
+        if: steps.check.outputs.behind != '0'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Always rebuild the sync branch from current main, so a stale branch
+          # from a previous run never replays old conflicts.
+          git checkout -B "$SYNC_BRANCH" main
+
+          if git merge upstream/main --no-edit; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+            # Record the conflicted paths before unwinding the merge.
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt
+            git merge --abort
+          fi
+
+          {
+            echo "range<<EOF"
+            git log --oneline --no-merges HEAD..upstream/main | head -50
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the pull request
+        if: steps.check.outputs.behind != '0' && steps.merge.outputs.clean == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git push --force-with-lease origin "$SYNC_BRANCH"
+
+          if [ -n "$(gh pr list --head "$SYNC_BRANCH" --state open --json number --jq '.[].number')" ]; then
+            echo "Existing PR updated with the latest upstream commits." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          gh pr create \
+            --base main \
+            --head "$SYNC_BRANCH" \
+            --title "Sync upstream: ${{ steps.check.outputs.behind }} new commit(s)" \
+            --body "$(cat <<'BODY'
+          Automated merge of `upstream/main` into `main`. It merged cleanly, but
+          **CI has not verified it** -- pushes from `GITHUB_TOKEN` do not trigger
+          the `pull_request` build, so check out the branch and run
+          `tsc --noEmit`, `eslint .` and `next build` before merging.
+
+          Worth a look every time:
+          - `src/db/migrations/` -- if upstream added migrations, they may collide
+            with our `0005`-`0007` numbering and the drizzle journal.
+          - `package.json` -- upstream prunes dependencies; confirm nothing our
+            fork imports was dropped.
+          - `eslint.config.mjs`, `src/config/routes.ts` -- both sides edit these.
+
+          Merging this PR is a push to `main`, which cuts a release. If upstream
+          has moved to a new base version, run the Release workflow manually with
+          an explicit version instead of taking the auto-bump.
+          BODY
+          )"
+
+      - name: Report the conflict
+        if: steps.check.outputs.behind != '0' && steps.merge.outputs.clean == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # One open conflict issue at a time -- a weekly schedule would
+          # otherwise file the same report until somebody does the merge.
+          if [ -n "$(gh issue list --label upstream-sync --state open --json number --jq '.[].number')" ]; then
+            echo "Conflict issue already open; leaving it alone." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          gh label create upstream-sync --color 0E8A16 --description "Upstream sync automation" 2>/dev/null || true
+
+          {
+            echo "\`upstream/main\` no longer merges cleanly, so this needs a human."
+            echo
+            echo "## Conflicted files"
+            echo '```'
+            cat /tmp/conflicts.txt
+            echo '```'
+            echo
+            echo "## To resolve"
+            echo '```bash'
+            echo "git fetch upstream && git checkout main"
+            echo "git merge upstream/main"
+            echo "# resolve, then:"
+            echo "npx tsc --noEmit && npx eslint . && npm run build"
+            echo '```'
+            echo
+            echo "Keep our fork's intent where the two disagree -- past syncs have"
+            echo "needed our flat-config eslint setup preserved over upstream's."
+            echo
+            echo "## New upstream commits"
+            echo '```'
+            echo "${{ steps.merge.outputs.range }}"
+            echo '```'
+          } > /tmp/issue.md
+
+          gh issue create \
+            --title "Upstream sync needs manual merge (${{ steps.check.outputs.behind }} commit(s) behind)" \
+            --label upstream-sync \
+            --body-file /tmp/issue.md
