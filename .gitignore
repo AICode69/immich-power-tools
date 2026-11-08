@@ -44,3 +44,7 @@ next-env.d.ts
 /docs/plans
 
 .env
+
+# Claude Code's local settings: "Don't ask again" saves approved commands here
+# verbatim, secrets included. Claude Code only ignores it globally, not per repo.
+**/.claude/settings.local.json
